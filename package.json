@@ -2,7 +2,7 @@
   "name": "ai-token-usage-tracker",
   "displayName": "AI Token Usage Tracker",
   "description": "Analyze AI coding-assistant token usage, session statistics, and workflow-efficiency insights from local logs (GitHub Copilot and Claude Code).",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "publisher": "AlexandruLupei",
   "license": "MIT",
   "icon": "media/icon.png",

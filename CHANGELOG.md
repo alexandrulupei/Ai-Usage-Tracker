@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.10
+
+- New extension icon. No functional changes.
+
 ## 0.2.9
 
 First Marketplace release, published as **AI Token Usage Tracker** (`AlexandruLupei.ai-token-usage-tracker`).

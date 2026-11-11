@@ -8,12 +8,12 @@ Requires **VS Code 1.85 or newer**. Pick one of the two options.
 
 ### Option 1 — Install the prebuilt `.vsix` (quickest)
 
-1. Download the latest package from the [`releases/`](releases/) folder of this repository — currently [`ai-token-usage-tracker-0.2.9.vsix`](https://github.com/alexandrulupei/Ai-Usage-Tracker/raw/main/releases/ai-token-usage-tracker-0.2.9.vsix).
+1. Download the latest package from the [`releases/`](releases/) folder of this repository — currently [`ai-token-usage-tracker-0.2.10.vsix`](https://github.com/alexandrulupei/Ai-Usage-Tracker/raw/main/releases/ai-token-usage-tracker-0.2.10.vsix).
 2. Install it, either:
    - **From the UI:** open the **Extensions** view (`Ctrl+Shift+X`), click the `...` menu → **Install from VSIX...**, and pick the file; or
    - **From a terminal:**
      ```bash
-     code --install-extension ai-token-usage-tracker-0.2.9.vsix
+     code --install-extension ai-token-usage-tracker-0.2.10.vsix
      ```
 3. Reload VS Code when prompted, then follow [Setup](#setup).
 
@@ -30,7 +30,7 @@ git clone https://github.com/alexandrulupei/Ai-Usage-Tracker.git
 cd Ai-Usage-Tracker
 npm install
 npm run package        # compiles and writes releases/ai-token-usage-tracker-<version>.vsix
-code --install-extension releases/ai-token-usage-tracker-0.2.9.vsix
+code --install-extension releases/ai-token-usage-tracker-0.2.10.vsix
 ```
 
 To debug instead of installing, open the folder in VS Code and press `F5` to launch an Extension Development Host. For a rebuild-on-save dev loop, run `npm run watch`.
