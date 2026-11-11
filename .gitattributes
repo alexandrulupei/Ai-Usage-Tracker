@@ -7,3 +7,6 @@
 *.json text
 *.md   text
 *.svg  text
+
+# Prebuilt extension packages (zip) - never convert line endings
+*.vsix binary

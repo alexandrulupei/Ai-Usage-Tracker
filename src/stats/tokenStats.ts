@@ -2,8 +2,9 @@ import {
   ParsedSession,
   SessionStats,
 } from '../core/types';
-import { COST_FORMULA_VERSION, PRICING_TABLE_VERSION, computeCostBreakdown } from './billingCalculator';
+import { COST_FORMULA_VERSION, PRICING_TABLE_VERSION, computeCostBreakdown, hasMeasuredCost } from './billingCalculator';
 import { estimateSessionCaching } from './cacheEstimator';
+import { CHAT_HISTORY_LOWER_BOUND_FLAG } from '../core/chatHistory';
 
 /**
  * Compute session-level statistics from a parsed session.
@@ -37,12 +38,24 @@ export function computeSessionStats(parsed: ParsedSession): SessionStats {
     anyMeasured = measured;
   }
 
-  // Estimated USD cost under the new (Jun 1, 2026+) per-token billing.
+  // USD cost under usage-based billing (Jun 1, 2026+). A request whose log reports
+  // the billed amount (directCredits) uses it as-is — exact, and immune to the
+  // token-detail gaps below. Other requests are priced at list rates, and only
+  // THEIR token gaps can make the session's cost estimated/incomplete.
   const costAuditFlags = new Set<string>();
   let costUSD = 0;
   let effectiveCacheWriteTokens = 0;
+  let billedCount = 0;
+  let listPricedCount = 0;
   for (const r of costRequests) {
     effectiveCacheWriteTokens += r.cacheWriteTokens || 0;
+    for (const flag of r.tokenAuditFlags ?? []) { costAuditFlags.add(flag); }
+    if (hasMeasuredCost(r)) {
+      costUSD += r.directCredits! / 100;
+      billedCount++;
+      continue;
+    }
+    listPricedCount++;
     const breakdown = computeCostBreakdown(r.model, {
       inputTokens: r.inputTokens,
       outputTokens: r.outputTokens,
@@ -54,14 +67,21 @@ export function computeSessionStats(parsed: ParsedSession): SessionStats {
     });
     costUSD += breakdown.costs.totalUSD;
     for (const flag of breakdown.auditFlags) { costAuditFlags.add(flag); }
-    for (const flag of r.tokenAuditFlags ?? []) { costAuditFlags.add(flag); }
   }
+  if (billedCount > 0) { costAuditFlags.add('cost_from_billed_amount'); }
 
-  let costAuditState: SessionStats['costAuditState'] = anyEstimated && anyMeasured ? 'mixed'
-    : anyEstimated ? 'estimated'
-      : anyMeasured ? 'measured'
+  // Cache-token measurement only matters for list-priced requests.
+  const listEstimated = listPricedCount > 0 && anyEstimated;
+  const listMeasured = listPricedCount > 0 && (anyMeasured || isOtel);
+  const anyCostMeasured = billedCount > 0 || listMeasured;
+  let costAuditState: SessionStats['costAuditState'] = listEstimated && anyCostMeasured ? 'mixed'
+    : listEstimated ? 'estimated'
+      : anyCostMeasured ? 'measured'
         : 'incomplete';
-  if (costAuditFlags.has('cache_write_tokens_missing') || costAuditFlags.has('token_buckets_exceed_input')) {
+  if (costAuditFlags.has('cache_write_tokens_missing') || costAuditFlags.has('token_buckets_exceed_input')
+    // Chat-history recovery only knows the final tool-call round's prompt, so the
+    // session's input tokens (and token-formula USD) are a lower bound.
+    || costAuditFlags.has(CHAT_HISTORY_LOWER_BOUND_FLAG)) {
     costAuditState = 'incomplete';
   }
   if (costAuditState !== 'measured') { costAuditFlags.add(`cost_${costAuditState}`); }

@@ -1,4 +1,5 @@
-import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
+import initSqlJs, { Database as SqlJsDatabase, SqlJsStatic } from 'sql.js';
+import { acquireLock } from './fileLock';
 import * as path from 'path';
 import * as fs from 'fs';
 import {
@@ -15,55 +16,237 @@ import {
   TokenDataSource,
   ProviderId,
 } from '../core/types';
-import { computeCostUSD, getMultiplier, getPricing } from '../stats/billingCalculator';
+import { computeCostUSD, computeListCostUSD, getPricing } from '../stats/billingCalculator';
+
+/** Block the thread for `ms` (used only for short rename retries). */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Move `tmp` over `target`. Rename is atomic, but on Windows it fails with
+ * EPERM/EBUSY/EACCES while another process has `target` open (e.g. another
+ * window reading it to reload), so retry briefly; as a last resort copy the
+ * bytes over (still under the write lock, and readers re-check on failure).
+ */
+function replaceFile(tmp: string, target: string): void {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    try {
+      fs.renameSync(tmp, target);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') { throw err; }
+      sleepSync(50);
+    }
+  }
+  fs.copyFileSync(tmp, target);
+  try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+}
+
+/** Billed credits on a raw llm_requests row, or undefined when not reported. */
+function rowDirectCredits(row: Record<string, unknown>): number | undefined {
+  const v = row.direct_credits;
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
+}
 import { estimateSessionCaching } from '../stats/cacheEstimator';
 
 type SqlValue = string | number | null | Uint8Array;
 type SqlRow = Record<string, unknown>;
 
 const DB_FILENAME = 'copilot-usage.db';
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 14;
 
+/** Thrown by withWriteLock when another window holds the lock for the whole timeout. */
+export class DatabaseBusyError extends Error {
+  constructor() { super('The usage database is busy (another VS Code window is writing to it).'); }
+}
+
+export interface WriteLockOptions {
+  /** How long to wait for another window to finish (0 = don't wait). */
+  timeoutMs?: number;
+  /** Called once if we have to wait for another window. */
+  onWait?: () => void;
+}
+
+/** How often readers check the file for changes made by other windows. */
+const RELOAD_CHECK_MS = 1_500;
+
+/**
+ * The tracker database. sql.js keeps the whole database in memory, and every VS
+ * Code window (a separate extension-host process) has its own copy of the same
+ * file, so access is coordinated:
+ *  - WRITES happen only inside withWriteLock(): take the cross-process lock,
+ *    reload from disk if another window changed the file, apply the changes,
+ *    save atomically (temp file + rename), release. No window can overwrite
+ *    another's newer data.
+ *  - READS reload the in-memory copy when the file on disk has changed (checked
+ *    at most every RELOAD_CHECK_MS), so every window shows current data.
+ */
 export class TrackerDatabase {
   private db!: SqlJsDatabase;
+  private SQL!: SqlJsStatic;
   private dbPath: string;
+  private lockDir: string;
   private dirty = false;
+  /** True while this process holds the cross-process write lock. */
+  private lockHeld = false;
+  /** mtime+size of the file as of our last load/save ('' = never loaded). */
+  private diskSignature = '';
+  private lastReloadCheck = 0;
+  /** Serializes withWriteLock callers inside this process. */
+  private writeQueue: Promise<unknown> = Promise.resolve();
+  private reloadListeners: (() => void)[] = [];
 
   private constructor(storagePath: string) {
     this.dbPath = path.join(storagePath, DB_FILENAME);
+    this.lockDir = this.dbPath + '.lock';
   }
 
   static async create(storagePath: string, wasmPath: string): Promise<TrackerDatabase> {
     const instance = new TrackerDatabase(storagePath);
     fs.mkdirSync(storagePath, { recursive: true });
+    instance.SQL = await initSqlJs({ locateFile: () => wasmPath });
 
-    const SQL = await initSqlJs({ locateFile: () => wasmPath });
-
-    if (fs.existsSync(instance.dbPath)) {
-      const buffer = fs.readFileSync(instance.dbPath);
-      instance.db = new SQL.Database(buffer);
-    } else {
-      instance.db = new SQL.Database();
+    // Load what is on disk now (so views work immediately), then create/migrate
+    // the schema under the lock so two windows starting together can't race.
+    try {
+      instance.loadFromDisk();
+    } catch (err) {
+      // Unreadable right now (caught mid-write by another window): start empty;
+      // the locked step below reloads from disk because the signature differs.
+      console.warn('[AIUsageTracker] database unreadable at startup, will reload under lock:', err);
+      instance.db = new instance.SQL.Database();
+      instance.diskSignature = '';
     }
-
-    instance.initialize();
+    instance.initialize(false);
+    // Only a new or older-schema file needs persisting now; normally the schema is
+    // current and startup never touches the lock (so opening a window while
+    // another one syncs doesn't delay this window's views).
+    if (instance.dirty) {
+      try {
+        await instance.withWriteLock(() => undefined, { timeoutMs: 5_000 });
+      } catch (err) {
+        // Another window is mid-write (it is a new version too, so it migrated the
+        // file already). Our in-memory copy is migrated and fully usable; the next
+        // locked write reloads from disk and persists whatever is still needed.
+        if (!(err instanceof DatabaseBusyError)) { throw err; }
+        console.warn('[AIUsageTracker] database busy at startup; continuing with the in-memory copy');
+      }
+    }
     return instance;
   }
 
-  private initialize(): void {
+  /**
+   * Run `fn` with exclusive write access across all VS Code windows. Changes made
+   * by `fn` are saved before the lock is released. Rejects with DatabaseBusyError
+   * if another window holds the lock longer than `timeoutMs` (default 2 min).
+   */
+  withWriteLock<T>(fn: () => T | Promise<T>, opts: WriteLockOptions = {}): Promise<T> {
+    const run = async (): Promise<T> => {
+      const handle = await acquireLock(this.lockDir, {
+        timeoutMs: opts.timeoutMs ?? 120_000,
+        onWait: opts.onWait,
+      });
+      if (!handle) { throw new DatabaseBusyError(); }
+      this.lockHeld = true;
+      try {
+        // Another window may have written since we last looked: start from disk.
+        if (this.reloadIfDiskChanged()) { this.notifyReload(); }
+        this.initialize(true);
+        const result = await fn();
+        this.flush();
+        return result;
+      } finally {
+        this.lockHeld = false;
+        handle.release();
+      }
+    };
+    // Queue behind any write already in progress in this window.
+    const next = this.writeQueue.then(run, run);
+    this.writeQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * Check whether another window changed the database file and reload if so.
+   * Returns true when fresh data was loaded. Cheap (one stat) when unchanged.
+   */
+  checkForExternalChanges(): boolean {
+    if (this.lockHeld) { return false; }
+    this.lastReloadCheck = Date.now();
+    const reloaded = this.reloadIfDiskChanged();
+    if (reloaded) {
+      this.initialize(false);   // an older window version may have written it
+      this.notifyReload();
+    }
+    return reloaded;
+  }
+
+  /** Register a callback for when data written by another window is loaded. */
+  onDidReloadFromDisk(listener: () => void): { dispose(): void } {
+    this.reloadListeners.push(listener);
+    return { dispose: () => { this.reloadListeners = this.reloadListeners.filter(l => l !== listener); } };
+  }
+
+  private notifyReload(): void {
+    for (const l of this.reloadListeners) {
+      try { l(); } catch (err) { console.error('[AIUsageTracker] reload listener failed:', err); }
+    }
+  }
+
+  private readDiskSignature(): string {
+    try {
+      const st = fs.statSync(this.dbPath);
+      return `${st.mtimeMs}:${st.size}`;
+    } catch {
+      return 'missing';
+    }
+  }
+
+  private loadFromDisk(): void {
+    const signature = this.readDiskSignature();
+    const next = signature === 'missing'
+      ? new this.SQL.Database()
+      : new this.SQL.Database(fs.readFileSync(this.dbPath));
+    if (this.db) { try { this.db.close(); } catch { /* already closed */ } }
+    this.db = next;
+    this.diskSignature = signature;
+    this.dirty = false;
+  }
+
+  /** Reload when the file differs from what we last loaded/saved. */
+  private reloadIfDiskChanged(): boolean {
+    const signature = this.readDiskSignature();
+    if (signature === this.diskSignature || signature === 'missing') { return false; }
+    try {
+      this.loadFromDisk();
+      return true;
+    } catch (err) {
+      // E.g. caught mid-replace on a filesystem without atomic rename: keep the
+      // current copy and try again on the next check.
+      console.warn('[AIUsageTracker] could not reload database from disk:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Create or migrate the schema. With `persist` (only under the write lock) the
+   * result is saved; otherwise it is kept in memory and marked dirty so the next
+   * locked write persists it.
+   */
+  private initialize(persist: boolean): void {
     const result = this.db.exec('PRAGMA user_version');
     const version = result.length > 0 ? (result[0].values[0][0] as number) : 0;
+    if (version >= SCHEMA_VERSION) { return; }
     if (version === 0) {
       this.db.run(SCHEMA_SQL);
-      this.db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-      this.save();
-      return;
-    }
-    if (version < SCHEMA_VERSION) {
+    } else {
       this.migrate(version);
-      this.db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-      this.save();
     }
+    this.db.run(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+    this.markDirty();
+    if (persist) { this.save(); }
   }
 
   private migrate(from: number): void {
@@ -239,15 +422,45 @@ export class TrackerDatabase {
       this.addColumnIfMissing(reqCols, 'llm_requests', 'cache_write_1h_tokens', 'INTEGER DEFAULT 0');
       this.db.run('UPDATE sessions SET file_mtime = 0');
     }
+    if (from < 13) {
+      // Copilot debug-log span ids are per-process counters that restart when a chat
+      // is resumed after a reload; distinct calls sharing an id were collapsed by the
+      // (session_id, span_id) unique index + INSERT OR REPLACE. The parser now
+      // namespaces ids per epoch/file, so force a one-time re-parse of Copilot JSONL
+      // sessions to recover the dropped calls. ingestJsonlSession deletes the old
+      // rows first, so no stale/duplicate rows survive. Claude rows are untouched
+      // (their ids are API requestIds and were never affected).
+      this.db.run("UPDATE sessions SET file_mtime = 0 WHERE COALESCE(provider, 'copilot') = 'copilot' AND COALESCE(data_source, 'jsonl') = 'jsonl'");
+    }
+    if (from < 14) {
+      // Chat-request accuracy: subagent prompts (runSubagent-*.jsonl user_message)
+      // are no longer stored as user messages, and sessions whose requests all
+      // failed now keep their prompts. Re-parse Copilot JSONL sessions once so
+      // stored user_messages match (verified against VS Code chat history).
+      this.db.run("UPDATE sessions SET file_mtime = 0 WHERE COALESCE(provider, 'copilot') = 'copilot' AND COALESCE(data_source, 'jsonl') = 'jsonl'");
+    }
   }
 
+  /**
+   * Atomically replace the database file: write a temp file, then rename it over
+   * the original, so another window never reads a half-written database.
+   * Only called while holding the write lock.
+   */
   private save(): void {
-    const data = this.db.export();
-    const buffer = Buffer.from(data);
-    fs.writeFileSync(this.dbPath, buffer);
+    if (!this.lockHeld) {
+      // Writing without the lock could overwrite another window's newer data.
+      console.error('[AIUsageTracker] refusing to save the database without the write lock');
+      return;
+    }
+    const buffer = Buffer.from(this.db.export());
+    const tmp = `${this.dbPath}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, buffer);
+    replaceFile(tmp, this.dbPath);
+    this.diskSignature = this.readDiskSignature();
     this.dirty = false;
   }
 
+  /** Save pending changes. Only effective while holding the write lock. */
   flush(): void {
     if (this.dirty) { this.save(); }
   }
@@ -388,6 +601,19 @@ export class TrackerDatabase {
   }
 
   /**
+   * Sessions whose stored stats were computed with an older pricing table or cost
+   * formula. They are recomputed from the rows already in the DB (no re-parse, so
+   * sessions whose source logs were since deleted are repriced too).
+   */
+  getSessionIdsWithStaleCost(pricingTableVersion: number, costFormulaVersion: number): string[] {
+    return this.queryRows(
+      `SELECT session_id FROM session_stats
+       WHERE COALESCE(pricing_table_version, 0) < ? OR COALESCE(cost_formula_version, 0) < ?`,
+      [pricingTableVersion, costFormulaVersion]
+    ).map(r => r.session_id as string);
+  }
+
+  /**
    * Update cached_input_tokens for a specific LLM request record.
    * Used to enrich records with real cached token data from the Copilot
    * prompt export (which has usage.prompt_tokens_details.cached_tokens).
@@ -435,7 +661,7 @@ export class TrackerDatabase {
          AND lr.cached_input_tokens = 0
          AND s.provider = 'copilot'
          AND COALESCE(s.data_source, 'jsonl') != 'otel'
-         AND COALESCE(lr.cached_input_tokens_source, 'unknown') NOT IN ('otel', 'prompt_export', 'jsonl')
+         AND COALESCE(lr.cached_input_tokens_source, 'unknown') NOT IN ('otel', 'prompt_export', 'jsonl', 'chat_history')
        ORDER BY lr.timestamp ASC`,
       [startMs, endMs]
     ).map(r => mapLLMRequest(r));
@@ -595,7 +821,7 @@ export class TrackerDatabase {
 
   getSessionAnalytics(sessionId: string): SessionAnalytics | undefined {
     const requests = this.queryRows(
-      'SELECT model, input_tokens, output_tokens, ttft, duration, status, is_subagent, subagent_name, max_tokens, span_id, timestamp, reasoning_tokens, cached_input_tokens, cache_write_tokens, response_model FROM llm_requests WHERE session_id = ? ORDER BY timestamp',
+      'SELECT model, input_tokens, output_tokens, ttft, duration, status, is_subagent, subagent_name, max_tokens, span_id, timestamp, reasoning_tokens, cached_input_tokens, cache_write_tokens, response_model, direct_credits FROM llm_requests WHERE session_id = ? ORDER BY timestamp',
       [sessionId]
     );
     const messages = this.queryRows(
@@ -725,16 +951,17 @@ export class TrackerDatabase {
       estimatedCredits += computeCostUSD(model, {
         inputTokens: inp, outputTokens: out,
         cachedInputTokens: cached, cacheWriteTokens: cw,
+        directCredits: rowDirectCredits(r),
       });
-      // Reasoning cost: portion of output cost attributable to thinking
-      // Reasoning tokens are already included in outputTokens, so this is informational
+      // Reasoning cost / cache savings are informational list-price figures, so
+      // they use the tier that applied to this prompt size.
+      const pricing = getPricing(model, inp);
+      // Reasoning tokens are already included in outputTokens.
       if (reasoning > 0) {
-        const pricing = getPricing(model);
         reasoningCostUSD += (reasoning / 1_000_000) * pricing.output;
       }
       // Cache savings: difference between full input price and cached price
       if (cached > 0) {
-        const pricing = getPricing(model);
         cacheSavingsUSD += (cached / 1_000_000) * (pricing.input - pricing.cachedInput);
       }
     }
@@ -929,19 +1156,25 @@ export class TrackerDatabase {
       const isProductive = hasProduction || out >= 150;
       turnProductive.push(isProductive);
 
-      // Total cost of this turn
-      const cost = computeCostUSD(model, {
+      // Total cost of this turn (billed amount when reported, else list price)
+      const turnUsage = {
         inputTokens: inp,
         outputTokens: out,
         cachedInputTokens: (r.cached_input_tokens as number) || 0,
         cacheWriteTokens: (r.cache_write_tokens as number) || 0,
-      });
+      };
+      const listCost = computeListCostUSD(model, turnUsage);
+      const cost = computeCostUSD(model, { ...turnUsage, directCredits: rowDirectCredits(r) });
       turnCosts.push(cost);
 
       // Marginal cost: only NEW input tokens (delta from previous turn) + output
-      // This is the cost attributable to *this* turn's actual work, not repeated context
+      // This is the cost attributable to *this* turn's actual work, not repeated context.
+      // Priced at list (at the full prompt's tier), then scaled by billed/list so it
+      // stays a consistent share of the turn's actual cost.
       const newInput = i === 0 ? inp : Math.max(0, inp - prevInput);
-      const marginalCost = computeCostUSD(model, { inputTokens: newInput, outputTokens: out });
+      const tier = getPricing(model, inp);
+      const marginalList = (newInput * tier.input + out * tier.output) / 1_000_000;
+      const marginalCost = listCost > 0 ? marginalList * (cost / listCost) : marginalList;
       turnMarginalCosts.push(marginalCost);
       prevInput = inp;
 
@@ -1314,87 +1547,33 @@ export class TrackerDatabase {
   }
 
   /**
-   * For each user prompt in the period, return the model that answered it.
-   * Resolution order:
-   *   1. The first non-subagent llm_request in the same session whose parent_span_id
-   *      matches the user message span.
-   *   2. Fallback: the first non-subagent llm_request in the same session whose
-   *      timestamp is >= the user message timestamp and < the next user message.
+   * Activity in [startMs, endMs) for a provider:
+   *  - chatRequests: prompts the user sent (user_messages; subagent prompts are not
+   *    stored as user messages, and failed requests are included);
+   *  - sessions: distinct sessions with at least one chat request or LLM call.
    */
-  getUserPromptModelsInPeriod(startMs: number, endMs: number, provider?: ProviderId): { sessionId: string; timestamp: number; model: string }[] {
-    // user_messages has no provider column (CLAUDE-PROVIDER-PLAN.md §15 #2), so filter
-    // via a sessions JOIN rather than the (unbuildable) lr.provider predicate.
-    const providerClause = provider !== undefined ? 'AND s.provider = ?' : '';
-    const params: SqlValue[] = provider !== undefined ? [startMs, endMs, provider] : [startMs, endMs];
-    const messages = this.queryRows(
-      `SELECT um.session_id as session_id, um.span_id as span_id, um.timestamp as timestamp
-       FROM user_messages um
+  getActivityCounts(startMs: number, endMs: number, provider: ProviderId): { sessions: number; chatRequests: number } {
+    const chat = this.queryRows(
+      `SELECT COUNT(*) AS n FROM user_messages um
        JOIN sessions s ON s.id = um.session_id
-       WHERE um.timestamp >= ? AND um.timestamp < ?
-       ${providerClause}
-       ORDER BY um.session_id, um.timestamp`,
-      params
+       WHERE um.timestamp >= ? AND um.timestamp < ? AND COALESCE(s.provider, 'copilot') = ?`,
+      [startMs, endMs, provider]
     );
-    const out: { sessionId: string; timestamp: number; model: string }[] = [];
-    // Group next-msg lookup. `messages` is ordered by (session_id, timestamp) and each
-    // session's timestamps are pushed in that same order, so the array index is the
-    // message's position within its session.
-    const nextMsgInSession = new Map<string, number[]>();
-    for (const m of messages) {
-      const sid = m.session_id as string;
-      if (!nextMsgInSession.has(sid)) { nextMsgInSession.set(sid, []); }
-      nextMsgInSession.get(sid)!.push(m.timestamp as number);
-    }
-    // Per-session cursor so we advance by POSITION, not by timestamp value. indexOf(ts)
-    // would collapse two prompts sharing an identical millisecond timestamp onto the
-    // same window; a positional cursor gives each its own upper bound.
-    const sessionCursor = new Map<string, number>();
-    for (const m of messages) {
-      const sid = m.session_id as string;
-      const span = m.span_id as string;
-      const ts = m.timestamp as number;
-      const pos = sessionCursor.get(sid) ?? 0;
-      sessionCursor.set(sid, pos + 1);
-
-      // 1. parent-span match
-      let model = '';
-      if (span) {
-        const r1 = this.queryRows(
-          `SELECT model FROM llm_requests
-           WHERE session_id = ? AND parent_span_id = ? AND is_subagent = 0
-           ORDER BY timestamp LIMIT 1`,
-          [sid, span]
-        );
-        if (r1.length > 0) { model = (r1[0].model as string) || ''; }
-      }
-      // 2. timestamp window fallback
-      if (!model) {
-        const sessTs = nextMsgInSession.get(sid)!;
-        const upper = pos + 1 < sessTs.length ? sessTs[pos + 1] : Number.MAX_SAFE_INTEGER;
-        const r2 = this.queryRows(
-          `SELECT model FROM llm_requests
-           WHERE session_id = ? AND is_subagent = 0
-             AND timestamp >= ? AND timestamp < ?
-           ORDER BY timestamp LIMIT 1`,
-          [sid, ts, upper]
-        );
-        if (r2.length > 0) { model = (r2[0].model as string) || ''; }
-      }
-      out.push({ sessionId: sid, timestamp: ts, model: model || 'unknown' });
-    }
-    return out;
-  }
-
-  getUserMessagesInPeriod(startMs: number, endMs: number): { sessionId: string; timestamp: number }[] {
-    return this.queryRows(
-      `SELECT um.session_id, um.timestamp
-       FROM user_messages um
-       WHERE um.timestamp >= ? AND um.timestamp < ?`,
-      [startMs, endMs]
-    ).map(r => ({
-      sessionId: (r.session_id as string) || '',
-      timestamp: (r.timestamp as number) || 0,
-    }));
+    const sess = this.queryRows(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT um.session_id AS sid FROM user_messages um
+         JOIN sessions s ON s.id = um.session_id
+         WHERE um.timestamp >= ? AND um.timestamp < ? AND COALESCE(s.provider, 'copilot') = ?
+         UNION
+         SELECT lr.session_id AS sid FROM llm_requests lr
+         WHERE lr.timestamp >= ? AND lr.timestamp < ? AND COALESCE(lr.provider, 'copilot') = ?
+       )`,
+      [startMs, endMs, provider, startMs, endMs, provider]
+    );
+    return {
+      sessions: (sess[0]?.n as number) || 0,
+      chatRequests: (chat[0]?.n as number) || 0,
+    };
   }
 
   getSessionDominantModels(): Map<string, string> {
@@ -1415,18 +1594,28 @@ export class TrackerDatabase {
     this.db.run('DELETE FROM session_stats');
     this.db.run('DELETE FROM model_billing');
     this.db.run('DELETE FROM sessions');
-    this.markDirty();
-    this.save();
+    this.markDirty();   // saved when the caller's withWriteLock completes
   }
 
+  /**
+   * Close the in-memory database. Writes are saved when their write lock is
+   * released, so nothing is pending here; an in-memory schema migration that was
+   * never persisted (startup lock timeout) is simply redone by the next window.
+   */
   close(): void {
-    this.flush();
+    if (this.dirty && !this.lockHeld) {
+      console.warn('[AIUsageTracker] closing with unsaved in-memory changes (not persisted without the lock)');
+    }
     this.db.close();
   }
 
   // ---- Helpers ------------------------------------------------------------
 
   private queryRows(sql: string, params?: SqlValue[]): SqlRow[] {
+    // Pick up data written by other windows (throttled; never mid-write).
+    if (!this.lockHeld && Date.now() - this.lastReloadCheck >= RELOAD_CHECK_MS) {
+      this.checkForExternalChanges();
+    }
     const result = this.db.exec(sql, params);
     if (result.length === 0) { return []; }
     const cols = result[0].columns;

@@ -1,11 +1,12 @@
 import * as vscode from 'vscode';
-import { TrackerDatabase } from './database';
+import { TrackerDatabase, DatabaseBusyError } from './database';
 import { computeSessionStats } from '../stats/tokenStats';
 import { getConfig } from '../config';
 import { exportAndParsePromptLogs, buildMatchIndex } from '../core/promptExportReader';
 import { exportAndReadOtelDB, mapOtelToParsedSession } from '../core/otelReader';
 import { ingestJsonlSession } from './ingest';
 import { PROVIDERS } from '../core/providers';
+import { PRICING_TABLE_VERSION, COST_FORMULA_VERSION } from '../stats/billingCalculator';
 
 export interface SyncResult {
   totalDiscovered: number;
@@ -18,9 +19,32 @@ export interface SyncResult {
   otelSessions: number;
   jsonlSessions: number;
   otelAvailable: boolean;
+  /** Stored sessions whose cost was recomputed for a newer pricing table/formula. */
+  repriced: number;
+  /** True when the sync didn't run because another window held the database. */
+  busy: boolean;
 }
 
 let activeSync: Promise<SyncResult> | undefined;
+
+export interface SyncOptions {
+  /**
+   * Call Copilot's prompt-export command in Tier 3. Default true. Automatic /
+   * background syncs pass false: that command shows a "No chat prompts found to
+   * export." notification whenever the window has no prompts — even when called
+   * with a path (verified in Copilot Chat 0.73 source) — so running it on a timer
+   * would spam users. Matching against previously stored export entries still
+   * runs. Current debug logs carry cachedTokens on every call anyway; manual
+   * Refresh still performs the export.
+   */
+  includePromptExport?: boolean;
+  /**
+   * How long to wait if another VS Code window is writing the database. Background
+   * syncs pass 0: the other window is already doing the same work, so skip.
+   * Default 2 minutes (manual refresh).
+   */
+  waitForOtherWindowMs?: number;
+}
 
 /**
  * Three-tier hybrid sync:
@@ -31,33 +55,44 @@ let activeSync: Promise<SyncResult> | undefined;
 export async function syncAll(
   db: TrackerDatabase,
   progress?: vscode.Progress<{ message?: string; increment?: number }>,
-  wasmPath?: string
+  wasmPath?: string,
+  options: SyncOptions = {}
 ): Promise<SyncResult> {
   if (activeSync) { return activeSync; }
-  activeSync = syncAllInternal(db, progress, wasmPath).finally(() => {
+  // The whole sync is one cross-window transaction: it starts from the latest
+  // file on disk and saves before releasing the lock (see TrackerDatabase).
+  activeSync = db.withWriteLock(
+    () => syncAllInternal(db, progress, wasmPath, options),
+    {
+      timeoutMs: options.waitForOtherWindowMs ?? 120_000,
+      onWait: () => progress?.report({ message: 'Waiting for another VS Code window to finish syncing...' }),
+    },
+  ).catch(err => {
+    if (err instanceof DatabaseBusyError) { return { ...emptyResult(), busy: true }; }
+    throw err;
+  }).finally(() => {
     activeSync = undefined;
   });
   return activeSync;
 }
 
+function emptyResult(): SyncResult {
+  return {
+    totalDiscovered: 0, newOrUpdated: 0, skipped: 0, errors: 0, emptyCount: 0,
+    cachedTokensEnriched: 0, otelSessions: 0, jsonlSessions: 0, otelAvailable: false,
+    repriced: 0, busy: false,
+  };
+}
+
 async function syncAllInternal(
   db: TrackerDatabase,
-  progress?: vscode.Progress<{ message?: string; increment?: number }>,
-  wasmPath?: string
+  progress: vscode.Progress<{ message?: string; increment?: number }> | undefined,
+  wasmPath: string | undefined,
+  options: SyncOptions
 ): Promise<SyncResult> {
   const config = getConfig();
 
-  const result: SyncResult = {
-    totalDiscovered: 0,
-    newOrUpdated: 0,
-    skipped: 0,
-    errors: 0,
-    emptyCount: 0,
-    cachedTokensEnriched: 0,
-    otelSessions: 0,
-    jsonlSessions: 0,
-    otelAvailable: false,
-  };
+  const result: SyncResult = emptyResult();
 
   // Track which session IDs were already ingested from OTel
   const otelSessionIds = new Set<string>();
@@ -156,7 +191,10 @@ async function syncAllInternal(
 
     try {
       const parsed = await adapter.parse(disc, config.parseSubagentLogs);
-      if (!parsed || parsed.llmRequests.length === 0) {
+      // A session with chat requests but no LLM calls (every request failed, e.g.
+      // "Language model unavailable") is still real activity: ingest it so its
+      // chat requests are counted. Only sessions with neither are "empty".
+      if (!parsed || (parsed.llmRequests.length === 0 && parsed.userMessages.length === 0)) {
         // Clear any stale rows from a prior non-empty parse before recording the
         // session as empty, so orphaned requests don't linger (§15 #11b).
         if (existingMtime !== undefined) { db.deleteSessionData(disc.sessionId); }
@@ -187,11 +225,15 @@ async function syncAllInternal(
   try {
     progress?.report({ message: 'Enriching cached token data...' });
 
-    // Step 1: Export fresh data from the current VS Code session.
-    const freshEntries = await exportAndParsePromptLogs();
-    if (freshEntries.length > 0) {
-      // Step 2: Persist to DB so it survives restarts.
-      db.storePromptExportEntries(freshEntries);
+    // Step 1: Export fresh data from the current VS Code session. Skipped for
+    // background syncs (see SyncOptions.includePromptExport) — it is the only
+    // step that can raise a Copilot notification; steps 3-4 are DB-only.
+    if (options.includePromptExport !== false) {
+      const freshEntries = await exportAndParsePromptLogs();
+      if (freshEntries.length > 0) {
+        // Step 2: Persist to DB so it survives restarts.
+        db.storePromptExportEntries(freshEntries);
+      }
     }
 
     // Step 3: Build index from ALL stored entries (fresh + previously stored).
@@ -233,6 +275,19 @@ async function syncAllInternal(
     console.warn('[CopilotTracker] Cached token enrichment failed:', err);
   }
 
+  // ---- Reprice: sessions stored under an older pricing table / cost formula ----
+  // Runs after ingest + enrichment so it sees final rows. Cheap no-op once current.
+  try {
+    const stale = db.getSessionIdsWithStaleCost(PRICING_TABLE_VERSION, COST_FORMULA_VERSION);
+    if (stale.length > 0) {
+      progress?.report({ message: `Repricing ${stale.length} sessions...` });
+      for (const sessionId of stale) { recomputeStoredSessionStats(db, sessionId); }
+      result.repriced = stale.length;
+    }
+  } catch (err) {
+    console.warn('[AIUsageTracker] Repricing stored sessions failed:', err);
+  }
+
   db.flush();
   return result;
 }
@@ -241,11 +296,17 @@ function recomputeStoredSessionStats(db: TrackerDatabase, sessionId: string): vo
   const detail = db.getSessionDetail(sessionId);
   if (!detail) { return; }
   const toolCalls = db.getSessionToolCalls(sessionId);
-  const subagentNames = [...new Set(
+  const namesFromRows = [...new Set(
     detail.requests
       .filter(r => r.isSubagent && r.subagentName)
       .map(r => r.subagentName!)
   )];
+  // The original parse also counts subagents seen only as events (no LLM rows);
+  // keep the stored count so recomputing cost never shrinks this metric.
+  const storedCount = detail.stats.subagentCount || 0;
+  const subagentNames = storedCount > namesFromRows.length
+    ? [...namesFromRows, ...Array.from({ length: storedCount - namesFromRows.length }, (_, i) => `subagent-${i + 1}`)]
+    : namesFromRows;
   const stats = computeSessionStats({
     session: detail.session,
     llmRequests: detail.requests,

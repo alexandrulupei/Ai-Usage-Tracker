@@ -40,7 +40,8 @@ export async function buildSession(
     ? parseModelsJson(discovered.modelsJsonPath)
     : new Map();
 
-  // Collect events from main file
+  // Collect events from main file. The main file's first process epoch keeps raw
+  // span ids (namespace ''), so single-epoch sessions are stored exactly as before.
   const collected = collectEvents(
     mainResult.events,
     discovered.sessionId,
@@ -48,7 +49,8 @@ export async function buildSession(
     discovered.dirPath,
     models,
     false,
-    undefined
+    undefined,
+    ''
   );
 
   // Parse subagent child files if enabled
@@ -60,6 +62,9 @@ export async function buildSession(
 
       try {
         const childResult = parseJsonlFileSync(childPath);
+        // Each child file is its own span-counter namespace (it has its own
+        // session_start and restarts the counter), so prefix its ids with the
+        // file stem to keep them distinct from main-file spans.
         const childCollected = collectEvents(
           childResult.events,
           discovered.sessionId,
@@ -67,10 +72,13 @@ export async function buildSession(
           discovered.dirPath,
           models,
           true,
-          subagentName
+          subagentName,
+          childNamespace(childPath)
         );
         collected.llmRequests.push(...childCollected.llmRequests);
-        collected.userMessages.push(...childCollected.userMessages);
+        // A child file's user_message is the prompt the agent handed to the
+        // subagent, not something the user typed — counting it inflated chat
+        // requests (verified: main.jsonl alone matches VS Code's chat history).
         collected.toolCalls.push(...childCollected.toolCalls);
         collected.turnCount += childCollected.turnCount;
         if (subagentName) {
@@ -83,6 +91,11 @@ export async function buildSession(
   }
 
   if (!collected.session) { return null; }
+
+  // Last line of defence for the (session_id, span_id) unique index: namespacing
+  // makes ids unique on all observed data, but if a future log format ever repeats
+  // an id we disambiguate rather than let INSERT OR REPLACE silently drop a call.
+  ensureUniqueSpanIds(collected.llmRequests, discovered.sessionId);
 
   return {
     session: collected.session,
@@ -112,7 +125,8 @@ function collectEvents(
   dirPath: string,
   models: Map<string, ModelInfo>,
   isSubagent: boolean,
-  subagentName: string | undefined
+  subagentName: string | undefined,
+  fileNamespace: string
 ): CollectedData {
   let session: SessionInfo | null = null;
   const llmRequests: LLMRequestRecord[] = [];
@@ -123,12 +137,25 @@ function collectEvents(
   let lastTs = 0;
   let lastLlm: LLMRequestRecord | undefined;   // for attaching agent_response output
 
+  // Copilot Chat span ids are per-process counters ("0000000000000010"). When a
+  // chat is resumed after a VS Code reload, the extension appends a new
+  // session_start and the counter restarts, so distinct calls reuse the same id.
+  // Every session_start after the first opens a new "epoch"; ids are namespaced
+  // per epoch (and per file), applied identically to spanId AND parentSpanId so
+  // tool-call → LLM and message → LLM links stay correct. Verified on real logs:
+  // zero duplicate llm_request span ids within an epoch.
+  let sessionStarts = 0;
+  let epochPrefix = fileNamespace;
+  const ns = (id: string | undefined): string | undefined => (id ? epochPrefix + id : id);
+
   for (const event of events) {
     if (event.ts > lastTs) { lastTs = event.ts; }
 
     switch (event.type) {
       case 'session_start': {
         const e = event as SessionStartEvent;
+        sessionStarts++;
+        if (sessionStarts > 1) { epochPrefix = `${fileNamespace}e${sessionStarts - 1}:`; }
         if (!session) {
           session = {
             id: sessionId,
@@ -172,8 +199,8 @@ function collectEvents(
 
         llmRequests.push({
           sessionId,
-          spanId: e.spanId,
-          parentSpanId: e.parentSpanId,
+          spanId: ns(e.spanId) as string,
+          parentSpanId: ns(e.parentSpanId),
           timestamp: e.ts,
           duration: e.dur,
           model: e.attrs.model || 'unknown',
@@ -209,7 +236,7 @@ function collectEvents(
         const content = e.attrs.content || '';
         userMessages.push({
           sessionId,
-          spanId: e.spanId,
+          spanId: ns(e.spanId) as string,
           timestamp: e.ts,
           contentLength: content.length,
           contentPreview: content.substring(0, PREVIEW_LENGTH),
@@ -222,8 +249,8 @@ function collectEvents(
         const e = event as ToolCallEvent;
         toolCalls.push({
           sessionId,
-          spanId: e.spanId,
-          parentSpanId: e.parentSpanId,
+          spanId: ns(e.spanId) as string,
+          parentSpanId: ns(e.parentSpanId),
           timestamp: e.ts,
           duration: e.dur,
           toolName: e.name,
@@ -266,6 +293,36 @@ function collectEvents(
   }
 
   return { session, llmRequests, userMessages, toolCalls, turnCount, subagentNames };
+}
+
+/** Span-id namespace for a child (subagent) file: its file stem plus ':'. */
+function childNamespace(filePath: string): string {
+  const filename = filePath.split(/[\\/]/).pop() || '';
+  return filename.replace(/\.jsonl$/i, '') + ':';
+}
+
+/**
+ * Guarantee span ids are unique within a session so the DB's
+ * (session_id, span_id) unique index can never drop a distinct call. Collisions
+ * are suffixed with the call timestamp (and an ordinal if that still collides).
+ * Returns the number of ids that had to be rewritten (0 on all observed data).
+ */
+export function ensureUniqueSpanIds(requests: LLMRequestRecord[], sessionId: string): number {
+  const seen = new Set<string>();
+  let rewritten = 0;
+  for (const r of requests) {
+    if (!r.spanId) { continue; }
+    if (!seen.has(r.spanId)) { seen.add(r.spanId); continue; }
+    let candidate = `${r.spanId}#${r.timestamp}`;
+    for (let n = 2; seen.has(candidate); n++) { candidate = `${r.spanId}#${r.timestamp}#${n}`; }
+    r.spanId = candidate;
+    seen.add(candidate);
+    rewritten++;
+  }
+  if (rewritten > 0) {
+    console.warn(`[AIUsageTracker] ${sessionId}: disambiguated ${rewritten} colliding LLM span id(s)`);
+  }
+  return rewritten;
 }
 
 function extractSubagentName(filePath: string): string | undefined {

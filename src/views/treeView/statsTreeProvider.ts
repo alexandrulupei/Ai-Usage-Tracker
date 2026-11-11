@@ -2,7 +2,7 @@
 import { TrackerDatabase } from '../../db/database';
 import { SessionInfo, SessionStats, ProviderId } from '../../core/types';
 import { formatTokens, formatDateTime, getDateGroup, formatDuration } from '../../util/dateUtils';
-import { computeBillingStatus, getMultiplier, computeCostUSD, getBillingPeriodBounds, computeClaudeBilling } from '../../stats/billingCalculator';
+import { computeBillingStatus, computeCostUSD, getBillingPeriodBounds, computeClaudeBilling } from '../../stats/billingCalculator';
 import { getConfig } from '../../config';
 
 type TreeItemData =
@@ -62,8 +62,8 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemData
           `**Started** ${formatDateTime(s.startTime)}`,
           `**Duration** ${formatDuration(s.durationMs)}`,
           `**Tokens** ${formatTokens(s.totalTokens)} (in: ${formatTokens(s.totalInputTokens)}, out: ${formatTokens(s.totalOutputTokens)})`,
-          `**Cost (Jun 2026)** $${(s.costUSD ?? 0).toFixed(3)}${s.costAuditState ? ` (${s.costAuditState})` : ''}`,
-          `**Requests** ${s.llmRequestCount} | **Messages** ${s.userMessageCount} | **Tools** ${s.toolCallCount}`,
+          `**Cost** $${(s.costUSD ?? 0).toFixed(3)}${s.costAuditState ? ` (${s.costAuditState})` : ''}`,
+          `**Chat requests** ${s.userMessageCount} | **Model calls** ${s.llmRequestCount} | **Tools** ${s.toolCallCount}`,
           `**Model** ${s.dominantModel}`,
           `**Errors** ${s.errorCount}`,
         ];
@@ -151,27 +151,22 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemData
   }
 
   private getSessionChildren(s: SessionInfo & SessionStats): TreeItemData[] {
-    const config = getConfig();
     const isClaude = (s.provider ?? this.activeProvider) === 'claude';
     const costUSD = s.costUSD ?? 0;
 
     const items: TreeItemData[] = [];
     if (isClaude) {
-      // Claude: USD only — no premium-requests / credits (GitHub concepts).
+      // Claude: USD only — no AI credits (a GitHub concept).
       items.push({ kind: 'stat', label: 'Cost (USD)', value: `$${costUSD.toFixed(3)}` });
     } else {
-      // Copilot: each user message counts as 1 premium request x model multiplier.
-      const multiplier = getMultiplier(s.dominantModel, config.plan);
-      const currentReqs = Math.round(s.userMessageCount * multiplier * 10) / 10;
       const credits = Math.round(costUSD * 100 * 10) / 10; // 1 credit = $0.01
-      items.push({ kind: 'stat', label: 'Premium reqs (current)', value: `${currentReqs} x${multiplier}` });
-      items.push({ kind: 'stat', label: 'Cost (Jun 2026)', value: `$${costUSD.toFixed(3)} (${credits} cr)` });
+      items.push({ kind: 'stat', label: 'Cost', value: `$${costUSD.toFixed(3)} (${credits} cr)` });
     }
     items.push(
       { kind: 'stat', label: 'Audit state', value: s.costAuditState || 'unknown' },
       { kind: 'stat', label: 'Tokens', value: `${formatTokens(s.totalInputTokens)} in / ${formatTokens(s.totalOutputTokens)} out` },
-      { kind: 'stat', label: 'Requests', value: String(s.llmRequestCount) },
-      { kind: 'stat', label: 'Messages', value: String(s.userMessageCount) },
+      { kind: 'stat', label: 'Chat requests', value: String(s.userMessageCount) },
+      { kind: 'stat', label: 'Model calls', value: String(s.llmRequestCount) },
       { kind: 'stat', label: 'Tool calls', value: String(s.toolCallCount) },
       { kind: 'stat', label: 'Turns', value: String(s.turnCount) },
       { kind: 'stat', label: 'Duration', value: formatDuration(s.durationMs) },
@@ -354,7 +349,7 @@ export class QuickStatsTreeProvider implements vscode.TreeDataProvider<TreeItemD
     const wf = this.db.getWorkflowSummary(wfBounds.start, wfBounds.end, this.activeProvider);
 
     // Copilot billing is skipped entirely for Claude (§15 #5) — it relies on
-    // GitHub premium-request / AI-credit reads that are meaningless for Claude.
+    // GitHub AI-credit reads that are meaningless for Claude.
     const billing = isClaude ? undefined : computeBillingStatus(this.db, config.plan, Date.now(), periodOverride);
 
     const periodLabel = isAllTime
@@ -384,14 +379,14 @@ export class QuickStatsTreeProvider implements vscode.TreeDataProvider<TreeItemD
     // ?? BILLING section ???????????????????????????????????????????????????????
 
     if (billing) {
-    const premUsed  = billing.current.premiumRequestsUsed;
-    const premQuota = billing.current.premiumRequestsQuota;
-    if (isCurrentMonth) {
-      const pct = billing.current.percentUsed;
-      items.push({ kind: 'metric', label: 'Premium Requests', value: `${qFmt(premUsed)} / ${qFmt(premQuota)}  ${uBar(pct)} ${pct.toFixed(1)}%`, icon: 'graph-line' });
-    } else {
-      items.push({ kind: 'metric', label: 'Premium Requests', value: `${qFmt(premUsed)} total`, icon: 'graph-line' });
-    }
+    // Activity (informational): how many sessions and chat requests in the period.
+    const act = billing.activity;
+    items.push({
+      kind: 'metric', label: 'Activity',
+      value: `${qFmt(act.sessions)} sessions  ·  ${qFmt(act.chatRequests)} chat requests`,
+      icon: 'comment-discussion',
+      tooltip: '**Sessions:** Copilot sessions with at least one chat request or model call in this period.\n\n**Chat requests:** prompts you sent (including failed ones; prompts the agent sends to subagents are not counted).',
+    });
 
     const credUsed   = billing.new.aiCreditsUsed;
     const credQuota  = billing.new.aiCreditsQuota;
@@ -469,7 +464,7 @@ export class QuickStatsTreeProvider implements vscode.TreeDataProvider<TreeItemD
       : undefined;
     items.push({ kind: 'metric', label: 'Est. Cost', value: `${costStr}${promoNote}`, icon: 'symbol-numeric', tooltip: costTooltip });
     } else {
-      // Claude: USD + token totals only — no premium-requests / credits / promo (§7).
+      // Claude: USD + token totals only — no credits / promo (§7).
       const cb = computeClaudeBilling(this.db, { start: wfBounds.start, end: wfBounds.end }, periodLabel, config.claudeCostBasis, !isCurrentMonth);
       const t = cb.tokenTotals;
       const costLabel = config.claudeCostBasis === 'subscription' ? 'Cost (API-equiv)' : 'Cost (USD)';
@@ -495,9 +490,6 @@ export class QuickStatsTreeProvider implements vscode.TreeDataProvider<TreeItemD
     // ?? TIPS section ?????????????????????????????????????????????????????????
     if (isCurrentMonth && billing) {
       const tips: string[] = [];
-      if (billing.new.percentUsed !== null && billing.new.percentUsed > billing.current.percentUsed * 1.5) {
-        tips.push('Tool/subagent calls are FREE now but cost from June 1');
-      }
       if (wf.avgTurnsPerMessage > 8) {
         tips.push('High turns/msg \u2014 be more specific to save tokens');
       }

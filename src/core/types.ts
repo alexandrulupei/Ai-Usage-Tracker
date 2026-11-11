@@ -138,7 +138,13 @@ export interface ModelInfo {
   maxOutputTokens: number;
 }
 
-export type TokenDataSource = 'otel' | 'jsonl' | 'prompt_export' | 'estimated' | 'missing' | 'unknown';
+/**
+ * 'chat_history' = recovered from VS Code chat history (chatSessions) for requests
+ * with no debug-log coverage. Credits and output totals are per-request, but
+ * input tokens are only the FINAL tool-call round (a lower bound) and there is no
+ * cache breakdown. Treated as unmeasured for cache purposes.
+ */
+export type TokenDataSource = 'otel' | 'jsonl' | 'prompt_export' | 'estimated' | 'missing' | 'unknown' | 'chat_history';
 export type CostAuditState = 'measured' | 'estimated' | 'mixed' | 'incomplete';
 
 /**
@@ -296,9 +302,21 @@ export interface ParsedSession {
 
 // ---- Discovery types ------------------------------------------------------
 
+/**
+ * Which on-disk artifact a discovered session comes from. Absent = the provider's
+ * primary format (Copilot debug-log main.jsonl, Claude transcript).
+ *  - 'copilot-cli'  : ~/.copilot/session-state/<id>/events.jsonl
+ *  - 'chat-history' : VS Code chatSessions/<id>.jsonl (fallback when no debug-log
+ *                     usage exists; token counts are a lower bound)
+ */
+export type SessionSourceKind = 'debug-log' | 'copilot-cli' | 'chat-history';
+
 export interface DiscoveredSession {
   sessionId: string;
   provider?: ProviderId;
+  sourceKind?: SessionSourceKind;
+  /** VS Code chat-history file for the same session id, when one exists. */
+  chatHistoryPath?: string;
   dirPath: string;
   workspaceId: string;
   mainJsonlPath: string;
@@ -387,7 +405,8 @@ export interface OverviewData {
     plan: string;
     daysRemaining: number;
     notes: string[];
-    current: { used: number; quota: number; pct: number; breakdown: { model: string; requests: number; cost: number }[] };
+    /** Activity in the period (informational, not billing). */
+    activity: { sessions: number; chatRequests: number };
     new: {
       used: number;
       quota: number | null;

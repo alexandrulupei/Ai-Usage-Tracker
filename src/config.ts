@@ -15,6 +15,12 @@ export interface ExtensionConfig {
   claudeProjectsDirectory: string;
   /** How to frame Claude USD: 'api' = list-price spend; 'subscription' = API-equivalent. */
   claudeCostBasis: ClaudeCostBasis;
+  /** Root of the Copilot CLI session store (default ~/.copilot/session-state). */
+  copilotCliSessionStateDirectory: string;
+  /** Use VS Code chat history for chats with no debug-log usage (lower-bound tokens). */
+  chatHistoryFallback: boolean;
+  /** Minutes between background syncs; 0 disables periodic refresh. */
+  autoRefreshIntervalMinutes: number;
 }
 
 export function getConfig(): ExtensionConfig {
@@ -28,5 +34,8 @@ export function getConfig(): ExtensionConfig {
     plan: cfg.get<CopilotPlan>('plan', 'business'),
     claudeProjectsDirectory: cfg.get<string>('claudeProjectsDirectory', '~/.claude/projects'),
     claudeCostBasis: cfg.get<ClaudeCostBasis>('claudeCostBasis', 'api'),
+    copilotCliSessionStateDirectory: cfg.get<string>('copilotCliSessionStateDirectory', '~/.copilot/session-state'),
+    chatHistoryFallback: cfg.get<boolean>('chatHistoryFallback', true),
+    autoRefreshIntervalMinutes: cfg.get<number>('autoRefreshIntervalMinutes', 15),
   };
 }

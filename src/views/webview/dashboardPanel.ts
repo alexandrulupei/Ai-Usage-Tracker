@@ -9,7 +9,10 @@ import {
   ProviderId,
 } from '../../core/types';
 import { dateStringToEpoch } from '../../util/dateUtils';
-import { computeBillingStatus, getBillingPeriodBounds, computeClaudeBilling } from '../../stats/billingCalculator';
+import {
+  computeBillingStatus, getBillingPeriodBounds, computeClaudeBilling,
+  computeCostUSD, computeListCostUSD, getPricing,
+} from '../../stats/billingCalculator';
 import { getConfig } from '../../config';
 
 export class DashboardPanel {
@@ -85,7 +88,19 @@ export class DashboardPanel {
         if (detail) {
           const analytics = this.db.getSessionAnalytics(msg.sessionId);
           const toolCalls = this.db.getSessionToolCalls(msg.sessionId);
-          this.postMessage({ type: 'sessionDetail', data: { ...detail, analytics, toolCalls } });
+          // Pricing is computed here, from the single canonical table, so the webview
+          // never carries its own (drift-prone) copy of model prices.
+          const requests = detail.requests.map(r => {
+            const tier = getPricing(r.model, r.inputTokens);
+            return {
+              ...r,
+              costUSD: computeCostUSD(r.model, r),          // billed amount when reported
+              listCostUSD: computeListCostUSD(r.model, r),  // list price, for ratios
+              rateInput: tier.input,
+              rateOutput: tier.output,
+            };
+          });
+          this.postMessage({ type: 'sessionDetail', data: { ...detail, requests, analytics, toolCalls } });
         } else {
           this.postMessage({ type: 'error', message: `Session ${msg.sessionId} not found` });
         }
@@ -135,12 +150,7 @@ export class DashboardPanel {
       plan: billing.plan,
       daysRemaining: billing.daysRemaining,
       notes: billing.notes,
-      current: {
-        used: billing.current.premiumRequestsUsed,
-        quota: billing.current.premiumRequestsQuota,
-        pct: billing.current.percentUsed,
-        breakdown: billing.current.costBreakdown.map(b => ({ model: b.model, requests: b.requests, cost: b.multipliedCost })),
-      },
+      activity: billing.activity,
       new: {
         used: billing.new.aiCreditsUsed,
         quota: billing.new.aiCreditsQuota,
@@ -404,8 +414,6 @@ export class DashboardPanel {
   .title-dot { margin-right: 8px; font-size: 0.7em; vertical-align: middle; }
   .title-dot.copilot { color: var(--copilot); }
   .title-dot.claude  { color: var(--claude); }
-  /* Premium-request columns are a Copilot concept — hidden when viewing Claude. */
-  body[data-provider="claude"] .col-premium { display: none; }
 </style>
 </head>
 <body>
@@ -439,7 +447,7 @@ export class DashboardPanel {
     <div class="chart-container"><canvas id="modelChart"></canvas></div>
     <h2>Top Sessions</h2>
     <table id="topSessionsTable"><thead><tr>
-      <th>Date</th><th>Tokens</th><th class="col-premium">Premium reqs</th><th>Cost</th><th>Model</th><th>Msgs</th>
+      <th>Date</th><th>Tokens</th><th>Cost</th><th>Model</th><th>Chat reqs</th>
     </tr></thead><tbody></tbody></table>
   </div>
 </div>
@@ -453,12 +461,11 @@ export class DashboardPanel {
   <table id="sessionsTable"><thead><tr>
     <th data-sort="startTime">Date</th>
     <th data-sort="totalTokens">Tokens</th>
-    <th data-sort="_costNow" class="col-premium">Premium reqs</th>
     <th data-sort="_costJun">Cost</th>
     <th data-sort="_costPerMsg">$ / Msg</th>
     <th data-sort="dominantModel">Model</th>
     <th data-sort="repository">Repo</th>
-    <th data-sort="userMessageCount">Msgs</th>
+    <th data-sort="userMessageCount">Chat reqs</th>
     <th data-sort="durationMs">Duration</th>
   </tr></thead><tbody></tbody></table>
 </div>
@@ -476,73 +483,18 @@ let activeProvider = 'copilot';
 let sortCol = 'startTime';
 let sortDir = -1;
 
-// Billing lookup tables (in sync with src/stats/billingCalculator.ts).
-// Aliases sorted longest-first so e.g. "gpt-5.4-mini" matches before "gpt-5.4".
-// All pricing is per 1M tokens; 1 AI credit = $0.01 USD.
-const MODEL_TABLE = [
-  { aliases: ['claude-haiku-4.5','haiku-4.5'],          mult: 0.33, input: 1.00, cachedInput: 0.10, cacheWrite: 1.25, output: 5.00 },
-  { aliases: ['claude-sonnet-4.6','sonnet-4.6'],        mult: 1,    input: 3.00, cachedInput: 0.30, cacheWrite: 3.75, output: 15.00 },
-  { aliases: ['claude-sonnet-4.5','sonnet-4.5'],        mult: 1,    input: 3.00, cachedInput: 0.30, cacheWrite: 3.75, output: 15.00 },
-  { aliases: ['claude-sonnet-4','sonnet-4'],            mult: 1,    input: 3.00, cachedInput: 0.30, cacheWrite: 3.75, output: 15.00 },
-  { aliases: ['claude-opus-4.6-fast','opus-4.6-fast'],  mult: 30,   input: 30.00, cachedInput: 3.00, cacheWrite: 37.50, output: 150.00 },
-  { aliases: ['claude-opus-4.6','opus-4.6'],            mult: 3,    input: 5.00, cachedInput: 0.50, cacheWrite: 6.25, output: 25.00 },
-  { aliases: ['claude-opus-4.7','opus-4.7'],            mult: 15,   input: 5.00, cachedInput: 0.50, cacheWrite: 6.25, output: 25.00 },
-  { aliases: ['claude-opus-4.5','opus-4.5'],            mult: 3,    input: 5.00, cachedInput: 0.50, cacheWrite: 6.25, output: 25.00 },
-  { aliases: ['gpt-5.2-codex'],                          mult: 1,    input: 1.75, cachedInput: 0.175, output: 14.00 },
-  { aliases: ['gpt-5.3-codex'],                          mult: 1,    input: 1.75, cachedInput: 0.175, output: 14.00 },
-  { aliases: ['gpt-5.4-mini'],                           mult: 0.33, input: 0.75, cachedInput: 0.075, output: 4.50 },
-  { aliases: ['gpt-5.4-nano'],                           mult: 0.25, input: 0.20, cachedInput: 0.02,  output: 1.25 },
-  { aliases: ['gpt-5.4'],                                mult: 1,    input: 2.50, cachedInput: 0.25,  output: 15.00 },
-  { aliases: ['gpt-5.5'],                                mult: 7.5,  input: 5.00, cachedInput: 0.50,  output: 30.00 },
-  { aliases: ['gpt-5.2'],                                mult: 1,    input: 1.75, cachedInput: 0.175, output: 14.00 },
-  { aliases: ['gpt-5-mini'],                             mult: 0,    input: 0.25, cachedInput: 0.025, output: 2.00 },
-  { aliases: ['gpt-4.1'],                                mult: 0,    input: 2.00, cachedInput: 0.50,  output: 8.00 },
-  { aliases: ['gpt-4o-mini','gpt-4o-mini-2024-07-18'],   mult: 0,    input: 0.15, cachedInput: 0.075, output: 0.60 },
-  { aliases: ['gpt-4o'],                                 mult: 0,    input: 2.50, cachedInput: 1.25,  output: 10.00 },
-  { aliases: ['gemini-2.5-pro'],                         mult: 1,    input: 1.25, cachedInput: 0.125, output: 10.00 },
-  { aliases: ['gemini-3-flash'],                         mult: 0.33, input: 0.50, cachedInput: 0.05,  output: 3.00 },
-  { aliases: ['gemini-3.1-pro'],                         mult: 1,    input: 2.00, cachedInput: 0.20,  output: 12.00 },
-  { aliases: ['grok-code-fast-1','grok-code-fast'],      mult: 0.25, input: 0.20, cachedInput: 0.02,  output: 1.50 },
-  { aliases: ['raptor-mini'],                            mult: 0,    input: 0.25, cachedInput: 0.025, output: 2.00 },
-  { aliases: ['goldeneye'],                              mult: 1,    input: 1.25, cachedInput: 0.125, output: 10.00 },
-];
-const ALIAS_INDEX = MODEL_TABLE
-  .flatMap(e => e.aliases.map(a => ({ alias: a, entry: e })))
-  .sort((a, b) => b.alias.length - a.alias.length);
-const DEFAULT_ENTRY = { mult: 1, input: 3, cachedInput: 0.30, output: 15, cacheWrite: 3.75 };
-
-function resolveModel(model) {
-  if (!model) return { entry: DEFAULT_ENTRY, resolved: false };
-  const norm = String(model).toLowerCase()
-    .replace(/^(anthropic\\/|openai\\/|google\\/|xai\\/|github\\/)/, '')
-    .replace(/_/g, '-')
-    .trim();
-  for (const { alias, entry } of ALIAS_INDEX) {
-    if (norm.includes(alias)) return { entry, resolved: true };
-  }
-  return { entry: DEFAULT_ENTRY, resolved: false };
-}
-function getMultiplier(model) { return resolveModel(model).entry.mult; }
-function getCostUSD(model, inTok, outTok, cachedTok, cacheWriteTok) {
-  const { entry } = resolveModel(model);
-  cachedTok = cachedTok || 0; cacheWriteTok = cacheWriteTok || 0;
-  const uncachedIn = Math.max(0, (inTok || 0) - cachedTok - cacheWriteTok);
-  const cw = entry.cacheWrite || entry.input;
-  return (uncachedIn * entry.input + cachedTok * entry.cachedInput + cacheWriteTok * cw + (outTok || 0) * entry.output) / 1_000_000;
-}
+// Pricing is computed by the extension from the canonical table in
+// src/stats/billingCalculator.ts and attached to the data it sends: detail requests
+// carry 'costUSD' (billed amount when the log reports it, else list price),
+// 'listCostUSD', 'rateInput', 'rateOutput'.
+// The webview deliberately has no price table of its own.
 function sessionBilling(s) {
-  const model = s.dominant_model || s.dominantModel || '';
-  const msgs = s.user_message_count ?? s.userMessageCount ?? 0;
-  const inTok = s.total_input_tokens ?? s.totalInputTokens ?? 0;
-  const outTok = s.total_output_tokens ?? s.totalOutputTokens ?? 0;
-  const mult = getMultiplier(model);
-  const reqs = Math.round(msgs * mult * 10) / 10;
-  // Prefer authoritative server-computed cost if present.
+  // Cost is always computed by the extension (stored session cost).
   const costUSD = (typeof s.costUSD === 'number') ? s.costUSD
                 : (typeof s.cost_usd === 'number') ? s.cost_usd
-                : getCostUSD(model, inTok, outTok);
+                : 0;
   const credits = Math.round(costUSD * 100 * 10) / 10;
-  return { reqs, mult, credits, costUSD };
+  return { credits, costUSD };
 }
 
 // Provider toggle pills
@@ -704,28 +656,21 @@ function renderBilling(b) {
   let html = header;
   html += '<div class="billing-grid">';
 
-  // Current plan card
+  // Activity card (informational - not billing)
+  const act = b.activity || { sessions: 0, chatRequests: 0 };
+  const perSession = act.sessions > 0 ? (act.chatRequests / act.sessions).toFixed(1) : '0';
   html += '<div class="billing-card">';
-  html += '<h3>Current (Request-based)</h3>';
-  if (isHistorical) {
-    // Historical: show total used, no quota bar.
-    html += '<div class="headline">' + b.current.used.toFixed(1) + ' <span style="font-size:0.5em;color:var(--muted)">reqs (total)</span></div>';
-    html += '<div class="sub">Period total \u2014 quota not applicable</div>';
-  } else {
-    html += '<div class="headline">' + b.current.used.toFixed(1) + ' <span style="font-size:0.5em;color:var(--muted)">/ ' + b.current.quota + ' reqs</span></div>';
-    html += '<div class="sub">' + b.current.pct + '% used this month</div>';
-    html += '<div class="progress-bar"><div class="progress-fill ' + pctClass(b.current.pct) + '" style="width:' + Math.min(b.current.pct, 100) + '%"></div></div>';
-  }
+  html += '<h3>Activity</h3>';
+  html += '<div class="headline">' + fmt(act.chatRequests) + ' <span style="font-size:0.5em;color:var(--muted)">chat requests</span></div>';
+  html += '<div class="sub">' + fmt(act.sessions) + ' sessions \u00b7 ' + perSession + ' requests / session</div>';
   html += '<div class="billing-breakdown">';
-  html += '<div class="row" style="font-weight:600"><span>Only your messages count</span><span>x multiplier</span></div>';
-  for (const item of b.current.breakdown.slice(0, 4)) {
-    html += '<div class="row"><span>' + esc(item.model) + '</span><span>' + item.requests + ' msgs -> ' + item.cost + ' reqs</span></div>';
-  }
+  html += '<div class="row"><span>Chat requests</span><span>prompts you sent (incl. failed)</span></div>';
+  html += '<div class="row"><span>Sessions</span><span>with a request or model call</span></div>';
   html += '</div></div>';
 
-  // New plan card
+  // AI credits card (usage-based billing)
   html += '<div class="billing-card">';
-  html += '<h3>From June 1 (Token-based)</h3>';
+  html += '<h3>AI Credits (usage-based)</h3>';
   if (isHistorical) {
     // Historical: show total credits and cost, no quota bar.
     html += '<div class="headline">' + b.new.used.toFixed(1) + ' <span style="font-size:0.5em;color:var(--muted)">credits (total)</span></div>';
@@ -740,7 +685,7 @@ function renderBilling(b) {
     html += '<div class="progress-bar"><div class="progress-fill ' + pctCls + '" style="width:' + pctWidth + '%"></div></div>';
   }
   html += '<div class="billing-breakdown">';
-  html += '<div class="row" style="font-weight:600"><span>ALL tokens count (incl. tools)</span><span>Credits</span></div>';
+  html += '<div class="row" style="font-weight:600"><span>All model calls (incl. tools, subagents)</span><span>Credits</span></div>';
   for (const item of b.new.breakdown.slice(0, 4)) {
     html += '<div class="row"><span>' + esc(item.model) + '</span><span>' + item.credits.toFixed(1) + ' cr (' + fmt(item.inputTokens) + ' in / ' + fmt(item.outputTokens) + ' out)</span></div>';
   }
@@ -750,8 +695,6 @@ function renderBilling(b) {
   html += '<div class="billing-comparison">';
   if (isHistorical) {
     html += '<div class="note">Showing period totals. Monthly quota bars are only applicable for the current billing period.</div>';
-  } else {
-    html += '<div class="note">Premium-request and AI-credit allowances use different units and cannot be compared directly. Both views describe the same underlying usage.</div>';
   }
   if (b.notes && b.notes.length) {
     for (const n of b.notes) {
@@ -759,7 +702,7 @@ function renderBilling(b) {
     }
   }
   if (b.new.cachedTokensCaptured === false && !b.new.cachedTokensEstimated) {
-    html += '<div class="note">[!] Cached / cache-write tokens are not present in the logs - the June cost shown is an UPPER BOUND.</div>';
+    html += '<div class="note">[!] Cached / cache-write tokens are not present in the logs - the cost shown is an UPPER BOUND.</div>';
   } else if (b.new.cachedTokensEstimated && !b.new.cachedTokensCaptured) {
     html += '<div class="note">[~] Cached token values are ESTIMATED based on provider caching rules (prefix matching, TTL, min thresholds). Actual savings may vary.</div>';
   } else if (b.new.cachedTokensCaptured && b.new.cachedTokensEstimated) {
@@ -815,7 +758,7 @@ function renderTopSessions(topSessions) {
   tbody.innerHTML = topSessions.map(s => {
     const date = new Date(s.startTime).toLocaleDateString();
     const b = sessionBilling(s);
-    return '<tr><td>' + esc(date) + '</td><td>' + fmt(s.total_tokens || s.totalTokens || 0) + '</td><td class="col-premium">' + b.reqs + ' x' + b.mult + '</td><td>$' + b.costUSD.toFixed(3) + '</td><td><span class="badge">' + esc(s.dominant_model || s.dominantModel || '') + '</span></td><td>' + (s.user_message_count || s.userMessageCount || 0) + '</td></tr>';
+    return '<tr><td>' + esc(date) + '</td><td>' + fmt(s.total_tokens || s.totalTokens || 0) + '</td><td>$' + b.costUSD.toFixed(3) + '</td><td><span class="badge">' + esc(s.dominant_model || s.dominantModel || '') + '</span></td><td>' + (s.user_message_count || s.userMessageCount || 0) + '</td></tr>';
   }).join('');
 }
 
@@ -830,7 +773,6 @@ function renderSessionsTable() {
     const b = sessionBilling(s);
     const msgs = s.user_message_count ?? s.userMessageCount ?? 0;
     return Object.assign({}, s, {
-      _costNow: b.reqs,
       _costJun: b.costUSD,
       _costPerMsg: msgs > 0 ? b.costUSD / msgs : 0,
       _billing: b,
@@ -858,7 +800,7 @@ function renderSessionsTable() {
     const dsBadge = ds === 'otel' ? '<span class="badge badge-otel">OTel</span>' : ds === 'hybrid' ? '<span class="badge badge-hybrid">Hyb</span>' : '';
     const audit = s.cost_audit_state || s.costAuditState || '';
     const auditBadge = audit && audit !== 'measured' ? ' <span class="badge badge-hybrid">' + esc(audit) + '</span>' : '';
-    return '<tr class="clickable" data-sid="' + sid + '"><td>' + esc(date) + '</td><td>' + fmt(tokens) + '</td><td class="col-premium">' + b.reqs + ' x' + b.mult + '</td><td>$' + b.costUSD.toFixed(3) + auditBadge + '</td><td>' + cpm + '</td><td><span class="badge">' + esc(model) + '</span></td><td>' + (repoShort ? esc(repoShort) : '<span class="muted">-</span>') + ' ' + dsBadge + '</td><td>' + msgs + '</td><td>' + esc(dur) + '</td></tr>';
+    return '<tr class="clickable" data-sid="' + sid + '"><td>' + esc(date) + '</td><td>' + fmt(tokens) + '</td><td>$' + b.costUSD.toFixed(3) + auditBadge + '</td><td>' + cpm + '</td><td><span class="badge">' + esc(model) + '</span></td><td>' + (repoShort ? esc(repoShort) : '<span class="muted">-</span>') + ' ' + dsBadge + '</td><td>' + msgs + '</td><td>' + esc(dur) + '</td></tr>';
   }).join('');
   tbody.querySelectorAll('tr.clickable').forEach(row => {
     row.addEventListener('click', () => {
@@ -918,11 +860,10 @@ function renderDetail(data) {
 
   // Summary row - the metrics that actually matter
   parts.push('<div class="metrics">');
-  parts.push(metric('Cost (Jun 2026)', '$' + b.costUSD.toFixed(3)));
+  parts.push(metric('Cost', '$' + b.costUSD.toFixed(3)));
   parts.push(metric('Audit state', st.cost_audit_state || st.costAuditState || 'unknown'));
-  parts.push(metric('Cost / Message', msgs > 0 ? '$' + costPerMsg.toFixed(3) : '-'));
-  parts.push(metric('Premium reqs', b.reqs + ' x' + b.mult));
-  parts.push(metric('Messages', String(msgs)));
+  parts.push(metric('Cost / Chat request', msgs > 0 ? '$' + costPerMsg.toFixed(3) : '-'));
+  parts.push(metric('Chat requests', String(msgs)));
   parts.push(metric('Tokens', fmt(totalTok)));
   parts.push(metric('Duration', a ? (a.activeMinutes + ' min') : '-'));
   // Reasoning tokens (only show when present)
@@ -1259,7 +1200,9 @@ function renderDetail(data) {
       const cwTok = r.cache_write_tokens ?? r.cacheWriteTokens ?? 0;
       const reasoningTok = r.reasoning_tokens ?? r.reasoningTokens ?? 0;
       const respModel = r.response_model ?? r.responseModel ?? '';
-      const costUSD = getCostUSD(r.model, inTok, outTok, cachedTok, cwTok);
+      // Computed by the extension: billed amount when reported, else list price.
+      const costUSD = (typeof r.costUSD === 'number') ? r.costUSD : 0;
+      const listCostUSD = (typeof r.listCostUSD === 'number') ? r.listCostUSD : 0;
       runningCredits += costUSD;
       const ttft = r.ttft || 0;
       const dur = r.duration || r.dur || 0;
@@ -1290,7 +1233,10 @@ function renderDetail(data) {
 
       // Marginal cost: cost of NEW input tokens (delta) + output. The rest is re-billed context from prior turns.
       const newInput = turnIndex === 1 ? inTok : Math.max(0, inputDelta);
-      const marginalCost = getCostUSD(r.model, newInput, outTok);
+      // Priced at this prompt's list rates, scaled by billed/list so it stays a
+      // consistent share of what the turn actually cost.
+      const marginalList = (newInput * (r.rateInput || 0) + outTok * (r.rateOutput || 0)) / 1_000_000;
+      const marginalCost = listCostUSD > 0 ? marginalList * (costUSD / listCostUSD) : marginalList;
       const marginalPct = costUSD > 0 ? Math.round((marginalCost / costUSD) * 100) : 0;
 
       // Header line: badge, turn#, model, action tag
@@ -1392,7 +1338,7 @@ function renderDetail(data) {
   parts.push('<dt>Tools/Turn</dt><dd>Average tool invocations per turn. ~1.0 is typical; higher means parallel tool use.</dd>');
   parts.push('<dt>Input/Output Ratio</dt><dd>Total input vs output tokens. >15:1 = context-heavy; ~1:1 = generative tasks.</dd>');
   parts.push('<dt>Wasted Tokens</dt><dd>Tokens consumed by failed requests (errors, refusals). Pure cost with no value.</dd>');
-  parts.push('<dt>Subagent Tokens</dt><dd>Tokens consumed by delegated sub-agents. Counted against the new (Jun 2026) billing model.</dd>');
+  parts.push('<dt>Subagent Tokens</dt><dd>Tokens consumed by delegated sub-agents. Billed like any other model call.</dd>');
   parts.push('<dt>Reasoning Tokens</dt><dd>Tokens the model used for internal "thinking" (chain-of-thought). Already included in output token count and billed at output rate. High reasoning relative to visible output means the model is over-thinking. Only available from OTel data source.</dd>');
   parts.push('<dt>Cache Hit Rate</dt><dd>Percentage of input tokens served from cache. Cache hits are billed at a much lower rate (typically 10% of input). Higher is better. "~est" means the value is estimated from heuristics, not measured.</dd>');
   parts.push('<dt>Cache Savings</dt><dd>Dollar amount saved by cache hits vs paying full input price. Calculated as cached_tokens × (input_price - cached_price) per model.</dd>');

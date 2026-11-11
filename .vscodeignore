@@ -13,6 +13,7 @@ webpack.config.js
 **/*.map
 debug.log
 *.vsix
+releases/**
 CLAUDE-PROVIDER-PLAN.md
 COST-CALCULATION.md
 DATA-COLLECTION.md

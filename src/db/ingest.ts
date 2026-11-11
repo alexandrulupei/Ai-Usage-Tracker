@@ -15,7 +15,8 @@ import { computeSessionStats } from '../stats/tokenStats';
  * code recorded the mtime before the inserts, so a failed insert left the
  * session looking current while holding zero rows.)
  *
- * Caller guarantees `parsed.llmRequests.length > 0`.
+ * Caller guarantees the session has LLM requests and/or user messages (a session
+ * whose requests all failed has messages but no LLM rows; stats handle zero).
  */
 export function ingestJsonlSession(
   db: TrackerDatabase,

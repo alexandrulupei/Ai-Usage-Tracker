@@ -6,6 +6,8 @@ import { SessionTreeProvider, QuickStatsTreeProvider } from './views/treeView/st
 import { DashboardPanel } from './views/webview/dashboardPanel';
 import { ProviderId } from './core/types';
 import { detectCopilotEditors } from './core/logDiscovery';
+import { COPILOT_CLI_EDITOR_KEY, COPILOT_CLI_ID_PREFIX } from './core/providers/copilotCliDiscovery';
+import { getConfig } from './config';
 
 let db: TrackerDatabase | undefined;
 
@@ -71,6 +73,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       sessionTree.refresh();
       quickStatsTree.refresh();
       DashboardPanel.currentPanel?.refresh();
+      if (result.busy) {
+        vscode.window.showWarningMessage('AI Usage: another VS Code window is still writing usage data. Try again in a moment.');
+        return;
+      }
       vscode.window.showInformationMessage(
         `AI Usage: Found ${result.totalDiscovered} sessions. ${result.newOrUpdated} parsed, ${result.skipped} up-to-date, ${result.emptyCount} empty, ${result.errors} errors.`
       );
@@ -102,7 +108,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     vscode.commands.registerCommand('copilotUsageTracker.selectIdeSources', async () => {
       if (!db) { return; }
-      const detected = detectCopilotEditors();
+      const detected = detectCopilotEditors(getConfig().copilotCliSessionStateDirectory);
       if (detected.length === 0) {
         vscode.window.showInformationMessage(
           'AI Usage: no GitHub Copilot debug-logs found in any IDE. Enable file logging (VS Code: "github.copilot.chat.agentDebugLog.fileLogging.enabled"; JetBrains: Tools › GitHub Copilot › Chat › Enable Agent debug File Logging), run an agent chat, then retry.'
@@ -113,7 +119,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const enabled = cfg.get<string[]>('enabledEditors', []);
       type IdeItem = vscode.QuickPickItem & { editor: string };
       const items: IdeItem[] = detected.map(d => ({
-        label: d.editor === 'JetBrains' ? 'JetBrains IDEs (experimental)' : d.editor,
+        label: d.editor === 'JetBrains' ? 'JetBrains IDEs (experimental)'
+          : d.editor === COPILOT_CLI_EDITOR_KEY ? 'Copilot CLI sessions (~/.copilot)' : d.editor,
         description: `${d.sessionCount} Copilot session${d.sessionCount === 1 ? '' : 's'}`,
         editor: d.editor,
         picked: enabled.length === 0 ? true : enabled.includes(d.editor),
@@ -139,7 +146,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Rebuilding GitHub Copilot usage from selected IDEs...', cancellable: false },
         async (progress) => {
-          db!.clearProvider('copilot');
+          await db!.withWriteLock(() => db!.clearProvider('copilot'), {
+            onWait: () => progress.report({ message: 'Waiting for another VS Code window to finish syncing...' }),
+          });
           await syncAll(db!, progress, wasmPath);
         }
       );
@@ -159,7 +168,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         'Clear', 'Cancel'
       );
       if (answer === 'Clear') {
-        db.clearProvider(activeProvider);
+        try {
+          await db.withWriteLock(() => db!.clearProvider(activeProvider));
+        } catch (err) {
+          vscode.window.showWarningMessage(`AI Usage: could not clear the cache (${err instanceof Error ? err.message : String(err)}).`);
+          return;
+        }
         sessionTree.refresh();
         quickStatsTree.refresh();
         DashboardPanel.currentPanel?.refresh();
@@ -173,18 +187,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (!detail?.session.dirPath) { return; }
       // Copilot writes main.jsonl under the session dir; Claude's raw file is
       // <stem>.jsonl in the project dir (strip the 'claude:' id prefix). §15 #9.
+      // Copilot CLI sessions keep events.jsonl in their session dir; chat-history
+      // sessions point at the chatSessions dir and the file is <id>.jsonl|.json.
       const fsMod = require('fs');
-      let target: vscode.Uri;
+      const dir = detail.session.dirPath;
+      let candidates: string[];
       if (detail.session.provider === 'claude') {
-        const stem = item.id.replace(/^claude:/, '');
-        target = vscode.Uri.file(path.join(detail.session.dirPath, stem + '.jsonl'));
+        candidates = [path.join(dir, item.id.replace(/^claude:/, '') + '.jsonl')];
+      } else if (item.id.startsWith(COPILOT_CLI_ID_PREFIX)) {
+        candidates = [path.join(dir, 'events.jsonl')];
       } else {
-        target = vscode.Uri.file(path.join(detail.session.dirPath, 'main.jsonl'));
+        candidates = [path.join(dir, 'main.jsonl'), path.join(dir, item.id + '.jsonl'), path.join(dir, item.id + '.json')];
       }
-      if (fsMod.existsSync(target.fsPath)) {
-        vscode.window.showTextDocument(target);
+      const found = candidates.find(p => fsMod.existsSync(p));
+      if (found) {
+        vscode.window.showTextDocument(vscode.Uri.file(found));
       } else {
-        vscode.window.showWarningMessage(`Raw log not found: ${target.fsPath}`);
+        vscode.window.showWarningMessage(`Raw log not found: ${candidates[0]}`);
       }
     }),
 
@@ -205,18 +224,64 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
   );
 
-  // Auto-sync on activation
-  syncAll(db, undefined, wasmPath).then(result => {
-    sessionTree.refresh();
-    quickStatsTree.refresh();
-    if (result.newOrUpdated > 0) {
-      vscode.window.showInformationMessage(
-        `AI Usage: Loaded ${result.newOrUpdated} sessions.`
-      );
+  // Automatic sync: once on activation (the extension now activates on startup),
+  // then every `autoRefreshIntervalMinutes`. Background syncs are silent and skip
+  // Copilot's prompt-export command (it can raise its own notification). syncAll
+  // de-duplicates concurrent runs, so a timer tick during a manual refresh is a no-op.
+  // With several VS Code windows open, all share one database: a background sync
+  // that finds another window already syncing skips (that window does the work),
+  // and this window picks up the result through the external-change check below.
+  const backgroundSync = (reason: string): void => {
+    if (!db) { return; }
+    syncAll(db, undefined, wasmPath, { includePromptExport: false, waitForOtherWindowMs: 0 }).then(result => {
+      if (result.busy) {
+        console.log(`[AIUsageTracker] ${reason} sync skipped: another window is syncing`);
+        return;
+      }
+      if (result.newOrUpdated > 0) {
+        sessionTree.refresh();
+        quickStatsTree.refresh();
+        DashboardPanel.currentPanel?.refresh();
+      }
+      console.log(`[AIUsageTracker] ${reason} sync: ${result.newOrUpdated} updated, ${result.skipped} up-to-date, ${result.errors} errors`);
+    }).catch(err => {
+      console.error(`[AIUsageTracker] ${reason} sync failed:`, err);
+    });
+  };
+
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const scheduleBackgroundSync = (): void => {
+    if (timer) { clearInterval(timer); timer = undefined; }
+    const minutes = getConfig().autoRefreshIntervalMinutes;
+    if (minutes > 0) {
+      timer = setInterval(() => backgroundSync('periodic'), Math.max(1, minutes) * 60_000);
     }
-  }).catch(err => {
-    console.error('AI Usage Tracker: Initial sync failed:', err);
-  });
+  };
+  scheduleBackgroundSync();
+  context.subscriptions.push(
+    { dispose: () => { if (timer) { clearInterval(timer); } } },
+    vscode.workspace.onDidChangeConfiguration(e => {
+      if (e.affectsConfiguration('copilotUsageTracker.autoRefreshIntervalMinutes')) {
+        scheduleBackgroundSync();
+      }
+    }),
+  );
+
+  // Show data written by other windows: reload when the file changes (a cheap
+  // stat every 30s) and refresh the views when it did.
+  const externalChangeTimer = setInterval(() => { db?.checkForExternalChanges(); }, 30_000);
+  context.subscriptions.push(
+    { dispose: () => clearInterval(externalChangeTimer) },
+    db.onDidReloadFromDisk(() => {
+      sessionTree.refresh();
+      quickStatsTree.refresh();
+      DashboardPanel.currentPanel?.refresh();
+    }),
+  );
+
+  sessionTree.refresh();
+  quickStatsTree.refresh();
+  backgroundSync('startup');
 }
 
 export function deactivate(): void {

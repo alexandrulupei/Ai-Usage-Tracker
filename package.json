@@ -2,12 +2,12 @@
   "name": "copilot-usage-tracker",
   "displayName": "AI Usage Tracker",
   "description": "Analyze AI coding-assistant token usage, session statistics, and workflow-efficiency insights from local logs (GitHub Copilot and Claude Code).",
-  "version": "0.2.7",
+  "version": "0.2.9",
   "publisher": "local",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/local/copilot-usage-tracker"
+    "url": "https://github.com/alexandrulupei/Ai-Usage-Tracker"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -15,7 +15,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
@@ -204,6 +206,22 @@
           ],
           "default": "api",
           "description": "How to present Claude cost: 'api' = USD at Anthropic list prices; 'subscription' = API-equivalent (included in your Claude plan)."
+        },
+        "copilotUsageTracker.copilotCliSessionStateDirectory": {
+          "type": "string",
+          "default": "~/.copilot/session-state",
+          "description": "Root of the GitHub Copilot CLI session store. Sessions from VS Code's \"Copilot CLI\" chat type and the standalone `copilot` CLI are read from <dir>/<id>/events.jsonl. Include/exclude them via \"Select IDE Sources\"."
+        },
+        "copilotUsageTracker.chatHistoryFallback": {
+          "type": "boolean",
+          "default": true,
+          "description": "Recover Copilot requests that have no debug-log record (e.g. chats from before agent debug file logging was enabled) from VS Code chat history. Credits are per-request totals; input tokens cover only the final tool-call round, so such sessions are marked 'incomplete'."
+        },
+        "copilotUsageTracker.autoRefreshIntervalMinutes": {
+          "type": "number",
+          "default": 15,
+          "minimum": 0,
+          "description": "Minutes between silent background syncs (in addition to the sync at startup). 0 disables periodic refresh."
         }
       }
     }
@@ -214,7 +232,7 @@
     "watch": "webpack --mode development --watch",
     "lint": "eslint src --ext ts",
     "test": "node ./test/run-unit-tests.js",
-    "package": "vsce package"
+    "package": "vsce package --out releases/"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.6",

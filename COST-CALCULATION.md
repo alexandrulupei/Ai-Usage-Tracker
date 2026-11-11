@@ -8,6 +8,7 @@ This document explains exactly how the Copilot Usage Tracker computes costs for 
 
 - [Overview](#overview)
 - [Token Buckets](#token-buckets)
+- [Billed Amount First](#billed-amount-first)
 - [The Cost Formula](#the-cost-formula)
 - [Per-Model Pricing Table](#per-model-pricing-table)
 - [Model Resolution](#model-resolution)
@@ -19,7 +20,7 @@ This document explains exactly how the Copilot Usage Tracker computes costs for 
 - [Non-Anthropic Providers](#non-anthropic-providers)
 - [AI Credits Conversion](#ai-credits-conversion)
 - [Billing Period Aggregation](#billing-period-aggregation)
-- [Premium Request Multipliers (Legacy)](#premium-request-multipliers-legacy)
+- [Activity: Sessions and Chat Requests](#activity-sessions-and-chat-requests)
 - [Worked Examples](#worked-examples)
 - [Edge Cases and Limitations](#edge-cases-and-limitations)
 
@@ -29,10 +30,10 @@ This document explains exactly how the Copilot Usage Tracker computes costs for 
 
 GitHub Copilot's usage-based billing (effective June 1, 2026) charges per token. Every LLM request has:
 
-- **Input tokens** � what gets sent to the model (conversation history, system prompt, tool results, etc.)
-- **Output tokens** � what the model generates back
-- **Cached input tokens** � a subset of input tokens that were served from the provider's cache (cheaper)
-- **Cache-write tokens** � a subset of input tokens that were written into the cache for the first time (Anthropic charges a surcharge for this)
+- **Input tokens** — what gets sent to the model (conversation history, system prompt, tool results, etc.)
+- **Output tokens** — what the model generates back
+- **Cached input tokens** — a subset of input tokens that were served from the provider's cache (cheaper)
+- **Cache-write tokens** — a subset of input tokens that were written into the cache for the first time (Anthropic charges a surcharge for this)
 
 The extension computes a USD cost for each request, then converts to **AI credits** (1 credit = $0.01 USD).
 
@@ -64,16 +65,32 @@ The `max(0, ...)` clamp prevents negative values if the data is inconsistent.
 
 ---
 
+## Billed Amount First
+
+Every Copilot request in current logs records what GitHub actually billed: `copilotUsageNanoAiu` in debug logs, `copilotUsage.totalNanoAiu` in Copilot CLI sessions, and `copilotCredits` in recovered chat history (1,000,000,000 nanoAIU = 1 credit = $0.01). **When that amount is present, it is the request's cost**, and the token formula below is not used.
+
+List prices can't reproduce real bills exactly. Checked against real calls, the bill also depends on:
+- the **Auto** discount (10%, `auto_discount` in the model list);
+- the long-context tier;
+- time-limited promotions (an unannounced 0.7× rate seen from about 2026-11-02);
+- prices changing over time (`gpt-5.6-sol` changed three times between August and September 2026).
+
+On real data, the old list-price estimate showed Copilot at **1.99×** what was billed; the corrected table gives 0.93×, and using the billed amount is exact.
+
+The token formula is used for requests without a billed amount. That means Claude Code (whose transcripts record no billed amount) and the occasional Copilot request without one. A session's audit state is `measured` when its cost comes from billed amounts or from fully measured tokens.
+
+---
+
 ## The Cost Formula
 
 For a single request:
 
 ```
 costUSD =
-    (uncachedInput / 1,000,000) � inputRate
-  + (cachedInput   / 1,000,000) � cachedInputRate
-  + (cacheWrite    / 1,000,000) � cacheWriteRate
-  + (outputTokens  / 1,000,000) � outputRate
+    (uncachedInput / 1,000,000) × inputRate
+  + (cachedInput   / 1,000,000) × cachedInputRate
+  + (cacheWrite    / 1,000,000) × cacheWriteRate
+  + (outputTokens  / 1,000,000) × outputRate
 ```
 
 Where:
@@ -85,71 +102,111 @@ Where:
 
 ## Per-Model Pricing Table
 
-All prices are per 1 million tokens. Source: [GitHub Docs � Models and Pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing).
+All prices are USD per 1 million tokens, as of 2026-11-11. These tables are generated from `MODEL_TABLE` in `src/stats/billingCalculator.ts`, which is the single source of truth (the dashboard has no price table of its own).
+
+**Sources.** GitHub Copilot's own model list (the `billing.token_prices` in the `models.json` that Copilot writes next to every debug log; credits per 1M tokens ÷ 100 = USD), cross-checked against [GitHub Docs — Models and pricing](https://docs.github.com/en/copilot/reference/copilot-billing/models-and-pricing). The two agree for every model they both list. Claude Code uses the same table: Anthropic's first-party API prices are identical. Anthropic cache writes cost 1.25× input (5-minute TTL) or 2× (1-hour TTL); cache reads cost 0.1× input, but 0.05× on Opus 5.5 / Sonnet 5.5 and 0.025× on Fable 5.1 / 5.2.
+
+**Long context.** When a request's prompt is larger than the threshold, the **whole request** is billed at the long-context rates. This was verified against billed Copilot calls: billed/list was 1.94 at default rates and 0.99 at long-context rates.
+
+**Included models.** GPT-4.1, GPT-4o and GPT-4o mini cost 0 in Copilot. Copilot's model list prices them at 0, and real logs bill them at 0.
+
+A cache-write price of "—" means the model has no separate cache-write price; written tokens are billed at the input rate.
 
 ### Anthropic
 
-Anthropic models have a **cache-write** column. Other providers do not.
-
-| Model | Input | Cached Input | Cache Write | Output |
-|-------|------:|-------------:|------------:|-------:|
-| Claude Haiku 4.5 | $1.00 | $0.10 | $1.25 | $5.00 |
-| Claude Sonnet 4 | $3.00 | $0.30 | $3.75 | $15.00 |
-| Claude Sonnet 4.5 | $3.00 | $0.30 | $3.75 | $15.00 |
-| Claude Sonnet 4.6 | $3.00 | $0.30 | $3.75 | $15.00 |
-| Claude Opus 4.5 | $5.00 | $0.50 | $6.25 | $25.00 |
-| Claude Opus 4.6 | $5.00 | $0.50 | $6.25 | $25.00 |
-| Claude Opus 4.6 (fast) | $5.00 | $0.50 | $6.25 | $25.00 |
-| Claude Opus 4.7 | $5.00 | $0.50 | $6.25 | $25.00 |
-
-Cache-write rate = 1.25� the base input rate for all Anthropic models.
+| Model | Input | Cached input | Cache write (5m) | Cache write (1h) | Output | Long context: prompt > N tokens (input / cached / output) |
+|---|---:|---:|---:|---:|---:|---|
+| `claude-haiku-4.5` | $1.00 | $0.10 | $1.25 | $2.00 | $5.00 | — |
+| `claude-haiku-5.5` | $0.10 | $0.01 | $0.125 | $0.20 | $0.50 | > 100K: $0.50 / $0.05 / $2.50 |
+| `claude-sonnet-4` | $3.00 | $0.30 | $3.75 | $6.00 | $15.00 | — |
+| `claude-sonnet-4.5` | $3.00 | $0.30 | $3.75 | $6.00 | $15.00 | — |
+| `claude-sonnet-4.6` | $3.00 | $0.30 | $3.75 | $6.00 | $15.00 | — |
+| `claude-sonnet-5` | $2.00 | $0.20 | $2.50 | $4.00 | $10.00 | — |
+| `claude-sonnet-5.5` | $2.00 | $0.10 | $2.50 | $4.00 | $10.00 | — |
+| `claude-opus-4.5` | $5.00 | $0.50 | $6.25 | $10.00 | $25.00 | — |
+| `claude-opus-4.6` | $5.00 | $0.50 | $6.25 | $10.00 | $25.00 | — |
+| `claude-opus-4.6-fast` | $30.00 | $3.00 | $37.50 | $60.00 | $150.00 | — |
+| `claude-opus-4.7` | $5.00 | $0.50 | $6.25 | $10.00 | $25.00 | — |
+| `claude-opus-4.8` | $5.00 | $0.50 | $6.25 | $10.00 | $25.00 | — |
+| `claude-opus-4.8-fast` | $10.00 | $1.00 | $12.50 | $20.00 | $50.00 | — |
+| `claude-opus-5` | $5.00 | $0.50 | $6.25 | $10.00 | $25.00 | — |
+| `claude-opus-5.5` | $4.00 | $0.20 | $5.00 | $8.00 | $20.00 | — |
+| `claude-fable-5` | $10.00 | $1.00 | $12.50 | $20.00 | $50.00 | — |
+| `claude-fable-5.1` | $10.00 | $0.25 | $12.50 | $20.00 | $50.00 | — |
+| `claude-fable-5.2` | $8.00 | $0.20 | $10.00 | $16.00 | $40.00 | — |
 
 ### OpenAI
 
-| Model | Input | Cached Input | Output |
-|-------|------:|-------------:|-------:|
-| GPT-4.1 | $2.00 | $0.50 | $8.00 |
-| GPT-4o | $2.50 | $1.25 | $10.00 |
-| GPT-4o mini | $0.15 | $0.075 | $0.60 |
-| GPT-5 mini | $0.25 | $0.025 | $2.00 |
-| GPT-5.2 | $1.75 | $0.175 | $14.00 |
-| GPT-5.2-Codex | $1.75 | $0.175 | $14.00 |
-| GPT-5.3-Codex | $1.75 | $0.175 | $14.00 |
-| GPT-5.4 | $2.50 | $0.25 | $15.00 |
-| GPT-5.4 mini | $0.75 | $0.075 | $4.50 |
-| GPT-5.4 nano | $0.20 | $0.02 | $1.25 |
-| GPT-5.5 | $5.00 | $0.50 | $30.00 |
+| Model | Input | Cached input | Cache write (5m) | Cache write (1h) | Output | Long context: prompt > N tokens (input / cached / output) |
+|---|---:|---:|---:|---:|---:|---|
+| `gpt-4.1` | $0.00 | $0.00 | — | — | $0.00 | — |
+| `gpt-4o` | $0.00 | $0.00 | — | — | $0.00 | — |
+| `gpt-4o-mini` | $0.00 | $0.00 | — | — | $0.00 | — |
+| `gpt-5-mini` | $0.25 | $0.025 | — | — | $2.00 | — |
+| `gpt-5.2` | $1.75 | $0.175 | — | — | $14.00 | — |
+| `gpt-5.2-codex` | $1.75 | $0.175 | — | — | $14.00 | — |
+| `gpt-5.3-codex` | $1.75 | $0.175 | — | — | $14.00 | — |
+| `gpt-5.4` | $2.50 | $0.25 | — | — | $15.00 | > 272K: $5.00 / $0.50 / $22.50 |
+| `gpt-5.4-mini` | $0.75 | $0.075 | — | — | $4.50 | — |
+| `gpt-5.4-nano` | $0.20 | $0.02 | — | — | $1.25 | — |
+| `gpt-5.5` | $5.00 | $0.50 | — | — | $30.00 | > 272K: $10.00 / $1.00 / $45.00 |
+| `gpt-5.6-luna` | $0.20 | $0.02 | $0.25 | — | $1.20 | > 200K: $0.40 / $0.04 / $1.80 |
+| `gpt-5.6-terra` | $2.00 | $0.20 | $2.50 | — | $12.00 | > 272K: $4.00 / $0.40 / $18.00 |
+| `gpt-5.6-sol` | $4.00 | $0.40 | $5.00 | — | $20.00 | > 272K: $8.00 / $0.80 / $30.00 |
+| `gpt-6-luna` | $0.10 | $0.01 | $0.125 | — | $0.50 | > 272K: $0.20 / $0.02 / $0.75 |
+| `gpt-6-sol` | $2.00 | $0.20 | $2.50 | — | $10.00 | > 272K: $4.00 / $0.40 / $15.00 |
+| `gpt-6-astra` | $10.00 | $1.00 | $12.50 | — | $50.00 | > 272K: $20.00 / $2.00 / $75.00 |
+| `gpt-6.1-sol` | $2.00 | $0.10 | $2.50 | — | $10.00 | > 272K: $4.00 / $0.20 / $15.00 |
+| `gpt-6.1-terra` | $1.00 | $0.05 | $1.25 | — | $5.00 | > 272K: $2.00 / $0.10 / $7.50 |
 
 ### Google
 
-| Model | Input | Cached Input | Output |
-|-------|------:|-------------:|-------:|
-| Gemini 2.5 Pro | $1.25 | $0.125 | $10.00 |
-| Gemini 3 Flash | $0.50 | $0.05 | $3.00 |
-| Gemini 3.1 Pro | $2.00 | $0.20 | $12.00 |
+| Model | Input | Cached input | Cache write (5m) | Cache write (1h) | Output | Long context: prompt > N tokens (input / cached / output) |
+|---|---:|---:|---:|---:|---:|---|
+| `gemini-2.5-pro` | $1.25 | $0.125 | — | — | $10.00 | — |
+| `gemini-3-flash` | $0.50 | $0.05 | — | — | $3.00 | — |
+| `gemini-3.1-pro` | $2.00 | $0.20 | — | — | $12.00 | > 200K: $4.00 / $0.40 / $18.00 |
+| `gemini-3.5-flash` | $1.50 | $0.15 | — | — | $9.00 | — |
+| `gemini-3.6-flash` | $0.75 | $0.075 | — | — | $3.75 | — |
+| `gemini-3.7-flash` | $0.75 | $0.075 | — | — | $3.75 | — |
+| `gemini-3.8-flash` | $0.75 | $0.075 | — | — | $3.75 | — |
+| `gemini-4-argon` | $2.00 | $0.10 | — | — | $10.00 | — |
+| `gemini-4-carbon` | $2.00 | $0.10 | — | — | $10.00 | — |
 
 ### xAI
 
-| Model | Input | Cached Input | Output |
-|-------|------:|-------------:|-------:|
-| Grok Code Fast 1 | $0.20 | $0.02 | $1.50 |
+| Model | Input | Cached input | Cache write (5m) | Cache write (1h) | Output | Long context: prompt > N tokens (input / cached / output) |
+|---|---:|---:|---:|---:|---:|---|
+| `grok-code-fast-1` | $0.20 | $0.02 | — | — | $1.50 | — |
+| `grok-4.5` | $2.00 | $0.50 | — | — | $6.00 | > 200K: $4.00 / $1.00 / $12.00 |
+| `grok-4.6` | $2.00 | $0.50 | — | — | $6.00 | > 200K: $4.00 / $1.00 / $12.00 |
+| `grok-4.7` | $2.00 | $0.50 | — | — | $6.00 | > 200K: $4.00 / $1.00 / $12.00 |
 
-### Fine-tuned (GitHub)
+### Moonshot AI
 
-| Model | Input | Cached Input | Output |
-|-------|------:|-------------:|-------:|
-| Raptor mini | $0.25 | $0.025 | $2.00 |
-| Goldeneye | $1.25 | $0.125 | $10.00 |
+| Model | Input | Cached input | Cache write (5m) | Cache write (1h) | Output | Long context: prompt > N tokens (input / cached / output) |
+|---|---:|---:|---:|---:|---:|---|
+| `kimi-k3` | $3.00 | $0.30 | — | — | $15.00 | — |
+| `kimi-k2.7-code` | $0.95 | $0.19 | — | — | $4.00 | — |
 
-### Unknown Models
+### Microsoft
 
-If a model name cannot be matched to any table entry, a conservative **default** is applied:
+| Model | Input | Cached input | Cache write (5m) | Cache write (1h) | Output | Long context: prompt > N tokens (input / cached / output) |
+|---|---:|---:|---:|---:|---:|---|
+| `mai-code-1-flash` | $0.75 | $0.075 | — | — | $4.50 | — |
+| `mai-code-1.1-flash` | $0.20 | $0.02 | $0.25 | — | $1.20 | — |
 
-| Input | Cached Input | Cache Write | Output |
-|------:|-------------:|------------:|-------:|
-| $3.00 | $0.30 | $3.75 | $15.00 |
+### Fine-tuned
 
-This mirrors Claude Sonnet pricing and ensures costs are not underestimated for unrecognized models.
+| Model | Input | Cached input | Cache write (5m) | Cache write (1h) | Output | Long context: prompt > N tokens (input / cached / output) |
+|---|---:|---:|---:|---:|---:|---|
+| `raptor-mini` | $0.25 | $0.025 | — | — | $2.00 | — |
+| `goldeneye` | $1.25 | $0.125 | — | — | $10.00 | — |
+| `oswe-vscode-prime` | $0.25 | $0.025 | — | — | $2.00 | — |
+
+### Unknown models
+
+A model that matches no entry is priced at a default of $3.00 / $0.30 / $3.75 / $15.00 and flagged `model_unresolved_pricing_fallback`. For Copilot this rarely matters, because the billed amount is used whenever the log reports it (see [Billed Amount First](#billed-amount-first)).
 
 ---
 
@@ -157,11 +214,13 @@ This mirrors Claude Sonnet pricing and ensures costs are not underestimated for 
 
 Model names from the debug logs can come in many forms. The resolver normalizes and matches them:
 
-1. **Vendor prefix stripping** � prefixes like `openai/`, `anthropic/`, `google/`, `xai/`, `github/` are removed  
-2. **Underscore normalization** � underscores become hyphens  
-3. **Case insensitive** � all matching is lowercase  
-4. **Longest-match-first** � aliases are sorted by descending length before matching, so `gpt-5.4-mini` always matches before `gpt-5.4`, and `claude-sonnet-4.5` before `claude-sonnet-4`
-5. **Date-suffix handling** � names like `gpt-4o-mini-2024-07-18` match via substring inclusion against the `gpt-4o-mini` alias
+1. **Vendor prefix stripping** — prefixes like `openai/`, `anthropic/`, `google/`, `xai/`, `github/` are removed  
+2. **Underscore normalization** — underscores become hyphens  
+3. **Case insensitive** — all matching is lowercase  
+4. **Longest-match-first** — aliases are sorted by descending length before matching, so `gpt-5.4-mini` always matches before `gpt-5.4`, and `claude-sonnet-4.5` before `claude-sonnet-4`
+5. **Date-suffix handling** — trailing snapshots (`-20250514`, `-2024-07-18`) are stripped, so `gpt-4o-mini-2024-07-18` resolves to `gpt-4o-mini`
+6. **Dash versions** — `claude-opus-5-5` (Claude Code / API form) is read as `claude-opus-5.5`; region and vendor prefixes (`us.anthropic.`, `copilot/`) and the `[1m]` marker are dropped
+7. **Version boundary** — an alias that ends in a version number only matches where the version ends. So `claude-opus-5` never claims `claude-opus-5.5` or a future `claude-opus-5.6`, and `gpt-4` never claims `gpt-4o`. A newer, unlisted version shows as **unknown** (flagged) rather than being silently priced as an older model. Suffixes after a dash still match (`gpt-5.6-luna-free-auto` → `gpt-5.6-luna`).
 
 Examples:
 
@@ -177,7 +236,7 @@ Examples:
 
 ## Cache Token Sources
 
-The debug JSONL logs produced by Copilot Chat **do not include cached token counts**. The extension obtains cache data from two sources, in order of preference:
+Current Copilot Chat debug logs (Copilot Chat 0.60 and later) record `cachedTokens` on every LLM call, but **not cache-write tokens**. Copilot CLI sessions and Claude Code transcripts record both. Cache data only affects cost for requests without a billed amount (see [Billed Amount First](#billed-amount-first)). Where cache data is missing, the extension falls back on two sources, in order of preference:
 
 ### Source A: Estimation (cacheEstimator)
 
@@ -187,19 +246,19 @@ When no real data is available, the extension estimates cached tokens using the 
 
 Requests within a session are grouped by `(model, subagent scope)` and processed chronologically. For each request in a group:
 
-**Step 1 � Is this the first request in its scope?**
+**Step 1 — Is this the first request in its scope?**
 - Yes ? **Cache miss.** The entire input is being seen for the first time.
-  - Anthropic: all input tokens are `cacheWriteTokens` (billed at 1.25� base)
+  - Anthropic: all input tokens are `cacheWriteTokens` (billed at 1.25× base)
   - Others: all input tokens are regular uncached input (no surcharge)
 
-**Step 2 � Is the input below the minimum cacheable threshold?**
+**Step 2 — Is the input below the minimum cacheable threshold?**
 - Yes ? No caching applies. All tokens are uncached input.
 
 Minimum thresholds per model:
 
 | Model | Min tokens |
 |-------|-----------|
-| Claude Opus 4.5�4.7, Haiku 4.5 | 4,096 |
+| Claude Opus 4.5–4.7, Haiku 4.5 | 4,096 |
 | Claude Sonnet 4.6, Haiku 3.5 | 2,048 |
 | Claude Sonnet 4/4.5, Opus 4/4.1 | 1,024 |
 | All OpenAI models | 1,024 |
@@ -207,7 +266,7 @@ Minimum thresholds per model:
 | Gemini Flash | 1,024 |
 | Others | 1,024 |
 
-**Step 3 � Has the cache TTL expired?**
+**Step 3 — Has the cache TTL expired?**
 - Yes (gap since previous request exceeds TTL) ? Cache miss (same as Step 1).
 
 TTLs used:
@@ -219,16 +278,16 @@ TTLs used:
 | Google | 5 minutes |
 | xAI | 5 minutes |
 
-**Step 4 � Was the context compacted?**
-- If `inputTokens < previousInputTokens � 0.7` (a 30%+ drop), the conversation was summarized/compacted ? the prefix hash changed entirely ? cache miss.
+**Step 4 — Was the context compacted?**
+- If `inputTokens < previousInputTokens × 0.7` (a 30%+ drop), the conversation was summarized/compacted ? the prefix hash changed entirely ? cache miss.
 
-**Step 5 � Estimate the cache hit**
+**Step 5 — Estimate the cache hit**
 - In multi-turn conversations, each request re-sends the full prior context plus new content. The cached portion is approximated as:
   ```
   cachedTokens = min(previousRequestInputTokens, currentRequestInputTokens)
   newDelta     = max(0, currentInputTokens ? cachedTokens)
   ```
-- For Anthropic: `cacheWriteTokens = newDelta` (the new content, billed at 1.25� base)
+- For Anthropic: `cacheWriteTokens = newDelta` (the new content, billed at 1.25× base)
 - For others: `cacheWriteTokens = 0` (no surcharge; new content billed at base rate)
 
 #### Subagent scoping
@@ -260,27 +319,27 @@ During billing aggregation (`computeBillingStatus`):
 4. The billing status reports whether values are measured, estimated, or a mix
 
 The UI shows notes like:
-- _"Cached token values are estimated based on provider caching rules"_ � all estimated
-- _"Some cached token values are measured from logs; others are estimated"_ � mixed
+- _"Cached token values are estimated based on provider caching rules"_ — all estimated
+- _"Some cached token values are measured from logs; others are estimated"_ — mixed
 
 ---
 
 ## Anthropic Cache-Write Surcharge
 
-This is the most nuanced part of the cost model. Anthropic charges **1.25� the base input rate** when tokens are written to cache for the first time. Other providers have no such surcharge.
+This is the most nuanced part of the cost model. Anthropic charges **1.25× the base input rate** when tokens are written to cache for the first time. Other providers have no such surcharge.
 
 ### When cache-write tokens are generated
 
 There are three paths:
 
-#### Path 1: Estimation � cache miss (first request or TTL expired)
+#### Path 1: Estimation — cache miss (first request or TTL expired)
 
 ```
 Anthropic:     cacheWriteTokens = inputTokens     (all input is cache-write)
 Non-Anthropic: cacheWriteTokens = 0                (no surcharge concept)
 ```
 
-#### Path 2: Estimation � cache hit (subsequent request within TTL)
+#### Path 2: Estimation — cache hit (subsequent request within TTL)
 
 ```
 Anthropic:     cacheWriteTokens = inputTokens ? cachedTokens   (only the new delta)
@@ -299,7 +358,7 @@ For a 100K-token Anthropic request where 80K tokens are cached:
 
 | Without surcharge | With surcharge (actual) |
 |-------------------|------------------------|
-| 100K � base rate | 80K � cached rate + 20K � 1.25� base rate |
+| 100K × base rate | 80K × cached rate + 20K × 1.25× base rate |
 | Higher overall | Lower overall (cache savings outweigh surcharge) |
 
 The surcharge only matters because it makes the **first request in a session** more expensive than base rate, since every input token is a cache-write.
@@ -310,7 +369,7 @@ The surcharge only matters because it makes the **first request in a session** m
 
 For OpenAI, Google, xAI, and GitHub fine-tuned models:
 
-- There is **no cache-write surcharge** � tokens written to cache cost the same as regular uncached input
+- There is **no cache-write surcharge** — tokens written to cache cost the same as regular uncached input
 - `cacheWriteTokens` is always 0 in both estimation and enrichment
 - The cost formula's fallback `cacheWrite ?? input` ensures these tokens (if somehow present) would be charged at the base input rate
 - The only discount comes from **cached input tokens**, which are billed at the model's `cachedInput` rate (typically 10-50% of base)
@@ -320,7 +379,7 @@ For OpenAI, Google, xAI, and GitHub fine-tuned models:
 ## AI Credits Conversion
 
 ```
-credits = costUSD � 100
+credits = costUSD × 100
 ```
 
 Since 1 AI credit = $0.01 USD, a request costing $0.2325 = 23.25 credits.
@@ -339,7 +398,6 @@ The billing period runs from the **1st of each month (00:00 UTC)** to the **1st 
 
 ### What gets counted
 
-- **Premium requests (legacy)**: Only user-initiated prompts (not tool calls or subagent requests). Each prompt is multiplied by the model's multiplier.
 - **AI credits (new)**: ALL LLM requests in the period, including tool-use loops and subagent calls. Token-level cost is computed for each request individually, then summed.
 
 ### Quota
@@ -349,39 +407,30 @@ The billing period runs from the **1st of each month (00:00 UTC)** to the **1st 
 | Free | Not published | Omitted from display |
 | Pro | 1,500 | 1,000 base + 500 flex |
 | Pro+ | 7,000 | 3,900 base + 3,100 flex |
-| Business | 1,900 (3,000 promo) | Pooled across org; promo Jun 1�Sep 1, 2026 |
-| Enterprise | 3,900 (7,000 promo) | Pooled across org; promo Jun 1�Sep 1, 2026 |
+| Business | 1,900 (3,000 promo) | Pooled across org; promo Jun 1–Sep 1, 2026 |
+| Enterprise | 3,900 (7,000 promo) | Pooled across org; promo Jun 1–Sep 1, 2026 |
 
 ### Aggregation flow
 
 ```
 1. Fetch all LLM requests in [periodStart, periodEnd)
 2. Run estimateSessionCaching() ? annotate with cached/cache-write tokens
-3. For each request: credits = computeCostUSD(model, usage) � 100
+3. For each request: credits = billed credits if the log reports them,
+   else computeCostUSD(model, usage) × 100 (list price, long-context tier aware)
 4. Sum all credits ? aiCreditsUsed
 5. Compare against quota ? percentUsed
 ```
 
 ---
 
-## Premium Request Multipliers (Legacy)
+## Activity: Sessions and Chat Requests
 
-Before June 1, 2026, billing was request-based. Each user prompt consumes `multiplier` premium requests.
+The request-based (premium request) billing view was removed. Since June 1, 2026 Copilot bills by usage (AI credits), and request multipliers no longer determine cost. Instead, each period shows **activity** for information:
 
-| Model | Paid plan multiplier | Free plan multiplier |
-|-------|--------------------:|---------------------:|
-| GPT-4.1, GPT-4o, GPT-5 mini | 0 (included) | 1 |
-| GPT-4o mini | 0 (included) | 1 |
-| Raptor mini | 0 (included) | 1 |
-| Grok Code Fast 1 | 0.25 | 1 |
-| GPT-5.4 nano | 0.25 | � |
-| Claude Haiku 4.5 | 0.33 | 1 |
-| GPT-5.4 mini, Gemini 3 Flash | 0.33 | � |
-| Most premium models | 1 | � |
-| Claude Opus 4.5/4.6 | 3 | � |
-| GPT-5.5 | 7.5 | � |
-| Claude Opus 4.7 | 15 | � |
-| Claude Opus 4.6 (fast) | 30 | � |
+- **Chat requests:** prompts you sent in the period, including failed ones (e.g. "Language model unavailable"). Prompts the agent hands to a subagent (`runSubagent-*.jsonl`) are not counted, because you didn't type them. Copilot CLI prompts are counted, and so are prompts recovered from VS Code chat history for chats the debug log never captured.
+- **Sessions:** distinct Copilot sessions with at least one chat request or model call in the period. A session that spans two months counts in both.
+
+On real data this matches VS Code's own chat history exactly in total (274 of 274 panel prompts; 71 of 71 Copilot CLI prompts). Per session there are two known differences: a request with empty prompt text (e.g. a continue click), which Copilot doesn't log as a prompt; and an edited-and-resent prompt, which VS Code's history keeps only once.
 
 ---
 
@@ -399,7 +448,7 @@ Before June 1, 2026, billing was request-based. Each user prompt consumes `multi
 | Output | **5,000** | $25.00 | **$0.1250** |
 | **Total** | | | **$0.2325** |
 
-AI credits = 0.2325 � 100 = **23.25 credits** (displayed as 23.3)
+AI credits = 0.2325 × 100 = **23.25 credits** (displayed as 23.3)
 
 ### Example 2: GPT-5.4 with partial caching
 
@@ -415,7 +464,7 @@ AI credits = 0.2325 � 100 = **23.25 credits** (displayed as 23.3)
 
 AI credits = **20.75 credits** (displayed as 20.8)
 
-### Example 3: Claude Sonnet 4 � first request (cache miss)
+### Example 3: Claude Sonnet 4 — first request (cache miss)
 
 **Scenario**: 80,000 input tokens + 3,000 output tokens. First request in session ? estimator assigns all input as cache-write.
 
@@ -427,9 +476,9 @@ AI credits = **20.75 credits** (displayed as 20.8)
 | Output | **3,000** | $15.00 | **$0.0450** |
 | **Total** | | | **$0.3450** |
 
-Compared to if there were no caching at all (all at base rate): 80K�$3.00/1M + 3K�$15.00/1M = $0.285. The cache-write surcharge adds $0.06 (25% of the input cost) to the first request.
+Compared to if there were no caching at all (all at base rate): 80K×$3.00/1M + 3K×$15.00/1M = $0.285. The cache-write surcharge adds $0.06 (25% of the input cost) to the first request.
 
-### Example 4: Claude Sonnet 4 � second request (cache hit, same session)
+### Example 4: Claude Sonnet 4 — second request (cache hit, same session)
 
 **Scenario**: Follow-up request with 95,000 input tokens + 2,000 output. Previous request had 80,000 input.
 
@@ -445,9 +494,9 @@ Estimator computes:
 | Output | **2,000** | $15.00 | **$0.0300** |
 | **Total** | | | **$0.1103** |
 
-Savings vs. no caching: 95K�$3.00/1M = $0.285 input alone ? actual input cost is $0.0803 ? **72% savings on input** thanks to the 80K cached portion.
+Savings vs. no caching: 95K×$3.00/1M = $0.285 input alone ? actual input cost is $0.0803 ? **72% savings on input** thanks to the 80K cached portion.
 
-### Example 5: GPT-5 mini � no caching (below threshold)
+### Example 5: GPT-5 mini — no caching (below threshold)
 
 **Scenario**: 500 input tokens + 200 output tokens. Below the 1,024 minimum cacheable threshold.
 
@@ -465,11 +514,19 @@ AI credits = **0.0525 credits**
 
 ### No cached data available
 
-When neither real data nor estimation is possible (e.g., isolated requests with no session context), the cost shown is an **upper bound** � all input tokens are charged at the full base rate with no cache discount. The UI shows: _"Cached/cache-write token counts are not present in the logs; cost shown is an upper bound."_
+When neither real data nor estimation is possible (e.g., isolated requests with no session context), the cost shown is an **upper bound** — all input tokens are charged at the full base rate with no cache discount. The UI shows: _"Cached/cache-write token counts are not present in the logs; cost shown is an upper bound."_
 
-### Long-context surcharges not modeled
+### Long-context pricing
 
-GPT-5.4 (>272K tokens) and Gemini 2.5 Pro / 3.1 Pro (>200K tokens) have higher rates for long prompts. The extension uses the standard (shorter prompt) rates for all input lengths. This means costs for very long prompts may be **underestimated**.
+Models with a long-context tier (see the pricing table) are priced at the long-context rates for the whole request when its prompt exceeds the threshold. Such requests carry the audit flag `long_context_pricing`.
+
+### What list prices don't model
+
+The Auto discount, time-limited promotions and historical price changes aren't modeled; list prices use the current rates. For Copilot this only affects requests without a billed amount (rare in current logs), and for those the list price is usually a slight overestimate. Promotions with a published end date are noted in the table: Gemini 4 Argon / Carbon until 2026-12-01, Gemini 3.8 Flash until 2026-12-31.
+
+### Repricing stored sessions
+
+Session costs are stored. Each one records the `pricing_table_version` and `cost_formula_version` it was computed with, and the next sync recomputes every session stored under an older version from the rows already in the database. That includes Claude sessions whose transcripts have since been deleted.
 
 ### Context compaction
 
@@ -481,7 +538,7 @@ Each subagent invocation (e.g., the Explore agent) starts a fresh cache scope. T
 
 ### Unknown models
 
-Any model not in the pricing table is charged at default rates ($3.00/$0.30/$3.75/$15.00 per 1M tokens � equivalent to Claude Sonnet). This is a conservative estimate that avoids undercharging.
+Any model not in the pricing table is charged at default rates ($3.00/$0.30/$3.75/$15.00 per 1M tokens) and flagged `model_unresolved_pricing_fallback`. The default is not reliably conservative: in the old table, Claude Opus 5 was under-reported by 40% and GPT-6 Luna over-reported 23×. When a new model shows up as unresolved, add it to `MODEL_TABLE` using the prices in Copilot's `models.json`.
 
 ### Rounding
 

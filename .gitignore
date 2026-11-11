@@ -4,6 +4,8 @@ out/
 .vscode-test/
 .test-out/
 *.vsix
+# Prebuilt install packages are committed on purpose (see README "Installation")
+!releases/*.vsix
 *.db
 
 # Scratch/unused files

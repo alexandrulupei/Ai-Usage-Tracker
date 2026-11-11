@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { DiscoveredSession } from './types';
+import { discoverCopilotCliSessions, COPILOT_CLI_EDITOR_KEY } from './providers/copilotCliDiscovery';
 
 const COPILOT_CHAT_DEBUG = 'GitHub.copilot-chat/debug-logs';
 const COPILOT_CHAT_DEBUG_ALT = 'GitHub.copilot-chat\\debug-logs';
@@ -122,6 +123,66 @@ function vsCodeFamilyDebugRoots(): EditorDebugRoot[] {
   return roots;
 }
 
+/** A VS Code chat-history file (chatSessions/<sessionId>.jsonl|.json). */
+export interface ChatHistoryFile {
+  sessionId: string;
+  filePath: string;
+  /** workspaceStorage hash, or 'empty-window' for globalStorage/emptyWindowChatSessions. */
+  workspaceId: string;
+  mtimeMs: number;
+}
+
+function chatFilesIn(dir: string, workspaceId: string, out: Map<string, ChatHistoryFile>): void {
+  for (const f of readdirSafe(dir)) {
+    const m = /^(.+)\.(jsonl|json)$/i.exec(f);
+    if (!m) { continue; }
+    const filePath = path.join(dir, f);
+    let mtimeMs: number;
+    try { mtimeMs = fs.statSync(filePath).mtimeMs; } catch { continue; }
+    const existing = out.get(m[1]);
+    // Prefer the newer file if a session exists in both formats.
+    if (!existing || mtimeMs > existing.mtimeMs) {
+      out.set(m[1], { sessionId: m[1], filePath, workspaceId, mtimeMs });
+    }
+  }
+}
+
+/**
+ * Enumerate VS Code chat-history files across the enabled VS Code-family editors:
+ * <editor>/User/workspaceStorage/<ws>/chatSessions/ and
+ * <editor>/User/globalStorage/emptyWindowChatSessions/ (chats opened with no
+ * folder, which have no workspace debug-logs at all). Keyed by session id.
+ */
+export function discoverChatHistoryFiles(enabledEditors: string[]): Map<string, ChatHistoryFile> {
+  const out = new Map<string, ChatHistoryFile>();
+  for (const parent of getEditorParentRoots()) {
+    for (const editor of readdirSafe(parent)) {
+      if (!editorEnabled(editor, enabledEditors)) { continue; }
+      const user = path.join(parent, editor, 'User');
+      const wsStorage = path.join(user, 'workspaceStorage');
+      if (!fs.existsSync(wsStorage)) { continue; }
+      for (const ws of readdirSafe(wsStorage)) {
+        chatFilesIn(path.join(wsStorage, ws, 'chatSessions'), ws, out);
+      }
+      chatFilesIn(path.join(user, 'globalStorage', 'emptyWindowChatSessions'), 'empty-window', out);
+    }
+  }
+  return out;
+}
+
+/**
+ * The chat-history file that belongs to a debug-log session, derived from the
+ * workspaceStorage layout <ws>/GitHub.copilot-chat/debug-logs/<id>/.
+ */
+export function chatHistoryPathForDebugSession(sessionDir: string, sessionId: string): string | undefined {
+  const wsDir = path.dirname(path.dirname(path.dirname(sessionDir)));
+  for (const ext of ['.jsonl', '.json']) {
+    const p = path.join(wsDir, 'chatSessions', sessionId + ext);
+    if (fs.existsSync(p)) { return p; }
+  }
+  return undefined;
+}
+
 /**
  * Raw enumeration (ungated) of JetBrains Copilot debug-logs. JetBrains IDEs
  * store data under a different layout than VS Code; the GitHub Copilot plugin's
@@ -163,7 +224,7 @@ function jetBrainsDebugRoots(): EditorDebugRoot[] {
 }
 
 /** True when `editor` should be scanned given the enabled-editors selection. */
-function editorEnabled(editor: string, enabledEditors: string[]): boolean {
+export function editorEnabled(editor: string, enabledEditors: string[]): boolean {
   return enabledEditors.length === 0 || enabledEditors.includes(editor);
 }
 
@@ -192,11 +253,15 @@ function collectAutoDiscoverRoots(
  * a session count each. Ungated (ignores the current selection) so the picker
  * can always show the full set. GitHub Copilot only.
  */
-export function detectCopilotEditors(): DetectedEditor[] {
+export function detectCopilotEditors(copilotCliDir?: string): DetectedEditor[] {
   const counts = new Map<string, number>();
   for (const r of [...vsCodeFamilyDebugRoots(), ...jetBrainsDebugRoots()]) {
     counts.set(r.editor, (counts.get(r.editor) ?? 0) + countSessionDirs(r.dirPath));
   }
+  // Copilot CLI sessions live outside any editor's storage; expose them as their
+  // own selectable source so users can include/exclude them like an IDE.
+  const cliCount = discoverCopilotCliSessions(copilotCliDir).length;
+  if (cliCount > 0) { counts.set(COPILOT_CLI_EDITOR_KEY, cliCount); }
   return [...counts.entries()]
     .map(([editor, sessionCount]) => ({ editor, sessionCount }))
     .filter(e => e.sessionCount > 0)
