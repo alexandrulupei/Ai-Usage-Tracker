@@ -1,10 +1,11 @@
 {
-  "name": "copilot-usage-tracker",
-  "displayName": "AI Usage Tracker",
+  "name": "ai-token-usage-tracker",
+  "displayName": "AI Token Usage Tracker",
   "description": "Analyze AI coding-assistant token usage, session statistics, and workflow-efficiency insights from local logs (GitHub Copilot and Claude Code).",
   "version": "0.2.9",
-  "publisher": "local",
+  "publisher": "AlexandruLupei",
   "license": "MIT",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/alexandrulupei/Ai-Usage-Tracker"
@@ -232,7 +233,7 @@
     "watch": "webpack --mode development --watch",
     "lint": "eslint src --ext ts",
     "test": "node ./test/run-unit-tests.js",
-    "package": "vsce package --out releases/"
+    "package": "node -e \"require('fs').mkdirSync('releases',{recursive:true})\" && vsce package --out releases/"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.6",

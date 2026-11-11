@@ -1,4 +1,4 @@
-# AI Usage Tracker
+# AI Token Usage Tracker
 
 A VS Code extension that analyzes **GitHub Copilot** (Chat and CLI) and **Claude Code** token usage, session statistics, and cost insights from local logs. Track how many tokens you consume, estimate costs against your plan quota, and drill into individual requests — all without sending data anywhere. Switch between providers with a single click.
 
@@ -8,16 +8,18 @@ Requires **VS Code 1.85 or newer**. Pick one of the two options.
 
 ### Option 1 — Install the prebuilt `.vsix` (quickest)
 
-1. Download the latest package from the [`releases/`](releases/) folder of this repository — currently [`copilot-usage-tracker-0.2.9.vsix`](https://github.com/alexandrulupei/Ai-Usage-Tracker/raw/main/releases/copilot-usage-tracker-0.2.9.vsix).
+1. Download the latest package from the [`releases/`](releases/) folder of this repository — currently [`ai-token-usage-tracker-0.2.9.vsix`](https://github.com/alexandrulupei/Ai-Usage-Tracker/raw/main/releases/ai-token-usage-tracker-0.2.9.vsix).
 2. Install it, either:
    - **From the UI:** open the **Extensions** view (`Ctrl+Shift+X`), click the `...` menu → **Install from VSIX...**, and pick the file; or
    - **From a terminal:**
      ```bash
-     code --install-extension copilot-usage-tracker-0.2.9.vsix
+     code --install-extension ai-token-usage-tracker-0.2.9.vsix
      ```
 3. Reload VS Code when prompted, then follow [Setup](#setup).
 
 To update later, install the newer `.vsix` the same way; it replaces the old version.
+
+> **Installed an earlier build named "AI Usage Tracker" (`local.copilot-usage-tracker`)?** Uninstall it first. The extension now has a new ID, so the two would run side by side. The new one starts with an empty cache and rebuilds its statistics from the logs still on disk.
 
 ### Option 2 — Build from source
 
@@ -27,8 +29,8 @@ Requires [Node.js](https://nodejs.org/) and Git.
 git clone https://github.com/alexandrulupei/Ai-Usage-Tracker.git
 cd Ai-Usage-Tracker
 npm install
-npm run package        # compiles and writes releases/copilot-usage-tracker-<version>.vsix
-code --install-extension releases/copilot-usage-tracker-0.2.9.vsix
+npm run package        # compiles and writes releases/ai-token-usage-tracker-<version>.vsix
+code --install-extension releases/ai-token-usage-tracker-0.2.9.vsix
 ```
 
 To debug instead of installing, open the folder in VS Code and press `F5` to launch an Extension Development Host. For a rebuild-on-save dev loop, run `npm run watch`.
